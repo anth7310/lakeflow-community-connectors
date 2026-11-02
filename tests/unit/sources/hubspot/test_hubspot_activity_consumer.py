@@ -151,16 +151,16 @@ def test_excluded_invalid_number_does_not_fail_read(generated):
         assert len(list(rows)) == 1 and end
 
 
-class _PagedEmails(ActivityAPI):
-    def __init__(self):
-        super().__init__("emails")
+class _PagedActivity(ActivityAPI):
+    def __init__(self, table):
+        super().__init__(table)
         self.pages = [
             {"results": [self.parent()], "paging": {"next": {"after": "cursor-1"}}},
             {"results": [{**self.parent(), "id": "2"}]},
         ]
 
     def get(self, url, **kwargs):
-        if urlparse(url).path != "/crm/objects/2026-09/emails":
+        if urlparse(url).path != f"/crm/objects/2026-09/{self.table}":
             return super().get(url, **kwargs)
         after = parse_qs(urlparse(url).query).get("after", [None])[0]
         index = 0 if after is None else 1
@@ -178,22 +178,39 @@ def _association_targets(api):
 
 
 @pytest.mark.parametrize("generated", [False, True])
-def test_initial_email_scan_checkpoints_and_limits_associations(generated):
-    api = _PagedEmails()
+@pytest.mark.parametrize("table", ["calls", "emails", "notes", "tasks"])
+def test_initial_activity_scan_checkpoints_and_limits_associations(table, generated):
+    api = _PagedActivity(table)
     options = {"max_records_per_batch": "1", "associations": "contacts,companies"}
     with (
         patch("requests.get", side_effect=api.get),
         patch("requests.post", side_effect=api.post),
         patch("time.sleep"),
     ):
-        conn, _, _ = consumer("emails", generated)
-        rows, offset = conn.read_table("emails", {}, options)
+        conn, _, _ = consumer(table, generated)
+        rows, offset = conn.read_table(table, {}, options)
         assert [row["id"] for row in rows] == ["1"]
         assert offset["snapshotAfter"] == "cursor-1"
         assert _association_targets(api) == {"contacts", "companies"}
         api.requests.clear()
-        rows, offset = conn.read_table("emails", offset, options)
+        rows, offset = conn.read_table(table, offset, options)
         assert [row["id"] for row in rows] == ["2"]
         assert "snapshotAfter" not in offset
         assert offset.get("updatedAt")
+        assert _association_targets(api) == {"contacts", "companies"}
+
+
+@pytest.mark.parametrize("generated", [False, True])
+def test_meetings_snapshot_limits_associations_without_a_page_cap(generated):
+    api = _PagedActivity("meetings")
+    options = {"max_records_per_batch": "1", "associations": "contacts,companies"}
+    with (
+        patch("requests.get", side_effect=api.get),
+        patch("requests.post", side_effect=api.post),
+        patch("time.sleep"),
+    ):
+        conn, _, _ = consumer("meetings", generated)
+        rows, offset = conn.read_table("meetings", {}, options)
+        assert {row["id"] for row in rows} == {"1", "2"}
+        assert "snapshotAfter" not in offset
         assert _association_targets(api) == {"contacts", "companies"}
