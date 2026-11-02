@@ -53,6 +53,7 @@ from pyspark.sql.types import (
 from urllib.parse import quote
 import base64
 import hashlib
+import logging
 import requests
 
 
@@ -1204,6 +1205,7 @@ def register_lakeflow_source(spark):
 
     # 429 handling
     MAX_RETRIES = 5
+    RETRY_STATUSES = frozenset({429, 500, 502, 503})
     MAX_BACKOFF_S = 30.0
     REQUEST_TIMEOUT_S = 60
 
@@ -1644,7 +1646,7 @@ def register_lakeflow_source(spark):
                 # Batch read returns 207 when some IDs fail (e.g. deleted mid-run).
                 if resp.status_code in (200, 207):
                     return resp.json()
-                if resp.status_code == 429 and attempt < MAX_RETRIES:
+                if resp.status_code in RETRY_STATUSES and attempt < MAX_RETRIES:
                     self._sleep(self._retry_delay(resp, attempt))
                     continue
                 raise RuntimeError(
@@ -1673,6 +1675,9 @@ def register_lakeflow_source(spark):
     ########################################################
     # src/databricks/labs/community_connector/sources/hubspot/hubspot.py
     ########################################################
+
+    logger = logging.getLogger(__name__)
+
 
     class HubspotLakeflowConnect(LakeflowConnect):
         _STANDARD_OBJECT_TYPES = {
@@ -1826,7 +1831,7 @@ def register_lakeflow_source(spark):
                         return response.json()
                     except ValueError:
                         raise RuntimeError("Malformed HubSpot association GET JSON") from None
-                if response.status_code == 429 and attempt < MAX_RETRIES:
+                if response.status_code in RETRY_STATUSES and attempt < MAX_RETRIES:
                     self._history._sleep(self._history._retry_delay(response, attempt))
                     continue
                 raise RuntimeError(f"HubSpot association GET failed (status={response.status_code})")
@@ -1975,7 +1980,7 @@ def register_lakeflow_source(spark):
         _TABLE_OPTION_KEYS = frozenset({
             "max_records_per_batch", "history_properties", "history_since",
             "history_lookback_minutes", "include_properties", "exclude_properties",
-            "association_sync_mode", "pipeline_object_types",
+            "association_sync_mode", "pipeline_object_types", "associations",
         })
 
         @classmethod
@@ -2149,6 +2154,27 @@ def register_lakeflow_source(spark):
             # Complete active snapshots preserve current-state removal reconciliation.
             return table_name == "meetings" or cls._association_sync_mode(table_options) == "full_refresh"
 
+        def _selected_associations(self, table_name: str, table_options: Dict[str, str] | None) -> List[str]:
+            """Use the associations option when set. A missing key keeps discovery.
+
+            A comma-separated list replaces discovered targets, including custom
+            objects. An empty string hydrates none.
+            """
+            discovered = list(self._get_object_config(table_name).get("associations") or [])
+            if table_options is None or "associations" not in table_options:
+                return discovered
+            raw = table_options.get("associations")
+            if not isinstance(raw, str):
+                raise ValueError("associations must be a comma-separated string")
+            selected, seen = [], set()
+            for part in raw.split(","):
+                name = part.strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                selected.append(name)
+            return selected
+
         @classmethod
         def _options_cache_key(cls, table_name: str, table_options: Dict[str, str] | None) -> tuple:
             """Cache key covering the options that change schema/metadata output."""
@@ -2157,6 +2183,7 @@ def register_lakeflow_source(spark):
                 table_name,
                 opts.get("include_properties"),
                 opts.get("exclude_properties"),
+                opts.get("associations"),
                 cls._association_sync_mode(opts),
             )
 
@@ -2204,7 +2231,7 @@ def register_lakeflow_source(spark):
                 "cursor_field": config["cursor_field"],
                 "cursor_property_field": config["cursor_property_field"],
                 "property_names": property_names,
-                "associations": config.get("associations", []),
+                "associations": self._selected_associations(table_name, table_options),
                 "ingestion_type": ingestion_type,
             }
 
@@ -2338,13 +2365,17 @@ def register_lakeflow_source(spark):
             if is_history_table(table_name):
                 return self._history.read_table(table_name, start_offset, table_options)
 
-            # Determine if this is an incremental read
-            is_incremental = (
-                start_offset is not None and start_offset.get("updatedAt") is not None
-            )
+            start_offset = dict(start_offset or {})
+            # snapshotAfter means the first objects-API scan is unfinished.
+            # Meetings and full_refresh stay one complete snapshot.
             if self._uses_snapshot(table_name, table_options):
                 is_incremental = False
                 start_offset = {}
+            else:
+                is_incremental = (
+                    start_offset.get("updatedAt") is not None
+                    and not start_offset.get("snapshotAfter")
+                )
 
             return self._read_data(
                 table_name,
@@ -2439,16 +2470,26 @@ def register_lakeflow_source(spark):
             property_names = metadata.get("property_names", [])
             cursor_property_field = metadata.get("cursor_property_field")
             associations = metadata.get("associations", [])
-
-            # Only cap on the incremental path — full-refresh snapshots need
-            # to drain everything in a single call to keep the snapshot atomic.
-            max_records = self._parse_max_records(table_options) if incremental else None
+            uses_snapshot = self._uses_snapshot(table_name, table_options)
+            # Cap the first objects-API scan and checkpoint HubSpot's page cursor.
+            # Meetings and full_refresh still drain in one call.
+            bounded_snapshot = not incremental and not uses_snapshot
+            max_records = self._parse_max_records(table_options) if incremental or bounded_snapshot else None
 
             all_records = []
             snapshot_ids, snapshot_cursors = set(), set()
             after = None
+            if bounded_snapshot and start_offset and start_offset.get("snapshotAfter"):
+                after = str(start_offset.get("snapshotAfter"))
             checkpoint = start_offset.get("updatedAt") if start_offset else None
             latest_updated = checkpoint
+            pages = 0
+            logger.warning(
+                "HUBSPOT_READ table=%s incremental=%s bounded_snapshot=%s max_records=%s "
+                "associations=%s option=%s resume_after=%s",
+                table_name, incremental, bounded_snapshot, max_records,
+                ",".join(associations), (table_options or {}).get("associations", "<unset>"), after,
+            )
 
             while True:
                 if incremental:
@@ -2530,6 +2571,27 @@ def register_lakeflow_source(spark):
                     if updated_at and (not latest_updated or updated_at > latest_updated):
                         latest_updated = updated_at
 
+                pages += 1
+                if bounded_snapshot and (pages == 1 or pages % 5 == 0):
+                    logger.warning(
+                        "HUBSPOT_READ_PROGRESS table=%s page=%s page_rows=%s kept=%s after=%s",
+                        table_name, pages, len(transformed_records), len(all_records), after,
+                    )
+                if (
+                    bounded_snapshot
+                    and max_records is not None
+                    and len(all_records) >= max_records
+                    and after is not None
+                ):
+                    logger.warning(
+                        "HUBSPOT_READ_CHECKPOINT table=%s kept=%s snapshotAfter=%s updatedAt=%s",
+                        table_name, len(all_records), after, latest_updated,
+                    )
+                    offset = {"snapshotAfter": str(after)}
+                    if latest_updated:
+                        offset["updatedAt"] = latest_updated
+                    return all_records, offset
+
                 if after is None:
                     break
 
@@ -2537,11 +2599,15 @@ def register_lakeflow_source(spark):
                 time.sleep(0.1)
 
             # Cap the returned cursor at the init-time bound so the next call
-            # eventually short-circuits.
-            if incremental and latest_updated and latest_updated > self._init_ts:
+            # eventually short-circuits. A finished snapshot hands off the same way.
+            if (incremental or bounded_snapshot) and latest_updated and latest_updated > self._init_ts:
                 latest_updated = self._init_ts
 
             offset = {"updatedAt": latest_updated} if latest_updated else {}
+            logger.warning(
+                "HUBSPOT_READ_DONE table=%s kept=%s updatedAt=%s",
+                table_name, len(all_records), offset.get("updatedAt"),
+            )
             return all_records, offset
 
         def _hydrate_associations(self, table_name: str, records: List[Dict], targets: List[str]) -> None:

@@ -149,3 +149,51 @@ def test_excluded_invalid_number_does_not_fail_read(generated):
         rows, end = conn.read_table("meetings", {}, {
             "exclude_properties": "extra_decimal_metric"})
         assert len(list(rows)) == 1 and end
+
+
+class _PagedEmails(ActivityAPI):
+    def __init__(self):
+        super().__init__("emails")
+        self.pages = [
+            {"results": [self.parent()], "paging": {"next": {"after": "cursor-1"}}},
+            {"results": [{**self.parent(), "id": "2"}]},
+        ]
+
+    def get(self, url, **kwargs):
+        if urlparse(url).path != "/crm/objects/2026-09/emails":
+            return super().get(url, **kwargs)
+        after = parse_qs(urlparse(url).query).get("after", [None])[0]
+        index = 0 if after is None else 1
+        assert after in (None, "cursor-1")
+        payload = copy.deepcopy(self.pages[index])
+        return Mock(status_code=200, json=lambda payload=payload: payload)
+
+
+def _association_targets(api):
+    targets = set()
+    for method, url, _ in api.requests:
+        if method == "POST" and "/crm/associations/" in url:
+            targets.add(urlparse(url).path.split("/")[-3])
+    return targets
+
+
+@pytest.mark.parametrize("generated", [False, True])
+def test_initial_email_scan_checkpoints_and_limits_associations(generated):
+    api = _PagedEmails()
+    options = {"max_records_per_batch": "1", "associations": "contacts,companies"}
+    with (
+        patch("requests.get", side_effect=api.get),
+        patch("requests.post", side_effect=api.post),
+        patch("time.sleep"),
+    ):
+        conn, _, _ = consumer("emails", generated)
+        rows, offset = conn.read_table("emails", {}, options)
+        assert [row["id"] for row in rows] == ["1"]
+        assert offset["snapshotAfter"] == "cursor-1"
+        assert _association_targets(api) == {"contacts", "companies"}
+        api.requests.clear()
+        rows, offset = conn.read_table("emails", offset, options)
+        assert [row["id"] for row in rows] == ["2"]
+        assert "snapshotAfter" not in offset
+        assert offset.get("updatedAt")
+        assert _association_targets(api) == {"contacts", "companies"}
