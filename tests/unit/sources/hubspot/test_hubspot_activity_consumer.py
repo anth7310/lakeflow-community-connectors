@@ -174,7 +174,8 @@ def test_unrepresentable_numeric_property_fails_before_checkpoint(generated, num
         conn, _, _ = consumer("meetings", generated)
         start = {"updatedAt": "2026-01-01T00:00:00.000Z"}
         with pytest.raises((ValueError, RuntimeError), match="numeric|decimal|number"):
-            conn.read_table("meetings", start, {})
+            rows, _ = conn.read_table("meetings", start, {})
+            list(rows)
     assert start == {"updatedAt": "2026-01-01T00:00:00.000Z"}
 
 
@@ -249,7 +250,7 @@ def test_initial_activity_scan_checkpoints_and_limits_associations(table, genera
 
 
 @pytest.mark.parametrize("generated", [False, True])
-def test_meetings_snapshot_checkpoints_pages_and_limits_associations(generated):
+def test_meetings_snapshot_returns_every_page_despite_record_cap(generated):
     api = _PagedActivity("meetings")
     options = {"max_records_per_batch": "1", "associations": "contacts,companies"}
     with (
@@ -259,12 +260,7 @@ def test_meetings_snapshot_checkpoints_pages_and_limits_associations(generated):
     ):
         conn, _, _ = consumer("meetings", generated)
         rows, offset = conn.read_table("meetings", {}, options)
-        assert [row["id"] for row in rows] == ["1"]
-        assert offset["snapshotAfter"] == "cursor-1"
-        assert offset["meetingSnapshot"] == conn._init_ts
-        assert _association_targets(api) == {"contacts", "companies"}
-        api.requests.clear()
-        rows, offset = conn.read_table("meetings", offset, options)
-        assert [row["id"] for row in rows] == ["2"]
+        assert {row["id"] for row in rows} == {"1", "2"}
         assert "snapshotAfter" not in offset
         assert offset["meetingSnapshot"] == conn._init_ts
+        assert _association_targets(api) == {"contacts", "companies"}

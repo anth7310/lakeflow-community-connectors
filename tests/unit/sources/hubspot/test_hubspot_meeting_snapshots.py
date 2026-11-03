@@ -45,20 +45,16 @@ def test_meetings_default_snapshot_ignores_old_offset_and_cap(generated):
         capped = {"association_sync_mode": "incremental", "max_records_per_batch": "1"}
         api.active_calls = 0
         rows, offset = conn.read_table("meetings", dict(saved), capped)
-        assert [r["id"] for r in rows] == ["1"]
-        assert offset["snapshotAfter"] == "1"
+        assert {r["id"] for r in rows} == {"1", "2"}
+        assert "snapshotAfter" not in offset
         assert offset["meetingSnapshot"] == conn._init_ts
-        rows, done = conn.read_table("meetings", offset, capped)
-        assert [r["id"] for r in rows] == ["2"]
-        assert "snapshotAfter" not in done
-        assert done["meetingSnapshot"] == conn._init_ts
-        empty, same = conn.read_table("meetings", done, capped)
-        assert list(empty) == [] and same == done
+        empty, same = conn.read_table("meetings", offset, capped)
+        assert list(empty) == [] and same == offset
         conn2, _, _ = consumer("meetings", generated)
         assert conn2._init_ts != conn._init_ts
         api.active_calls = 0
-        rows, restarted = conn2.read_table("meetings", done, capped)
-        assert [r["id"] for r in rows] == ["1"]
+        rows, restarted = conn2.read_table("meetings", offset, capped)
+        assert {r["id"] for r in rows} == {"1", "2"}
         assert restarted["meetingSnapshot"] == conn2._init_ts
         assert list(conn.read_table_deletes("meetings", saved, {})[0]) == []
         assert saved == {"updatedAt": "2099-01-01T00:00:00.000Z"}
@@ -88,7 +84,8 @@ def test_incomplete_active_snapshot_never_publishes(generated, case):
         conn, _, _ = consumer("meetings", generated)
         start = {}
         with pytest.raises(RuntimeError, match="snapshot|pagination"):
-            conn.read_table("meetings", start, {"association_sync_mode": "full_refresh"})
+            rows, _ = conn.read_table("meetings", start, {"association_sync_mode": "full_refresh"})
+            list(rows)
         assert start == {}
 
 
@@ -103,12 +100,17 @@ def test_each_snapshot_returns_current_set_including_empty(generated):
         conn, _, _ = consumer("meetings", generated)
         rows, offset = conn.read_table("meetings", {}, {})
         assert {r["id"] for r in rows} == {"1", "2"}
+        empty, same = conn.read_table("meetings", offset, {})
+        assert list(empty) == [] and same == offset
+        conn2, _, _ = consumer("meetings", generated)
         api.active_calls = 0
         api.pages = [{"results": [{**api.parent(), "id": "2"}]}]
-        rows, offset = conn.read_table("meetings", offset, {})
+        rows, offset = conn2.read_table("meetings", offset, {})
         assert [r["id"] for r in rows] == ["2"]
+        conn3, _, _ = consumer("meetings", generated)
+        api.active_calls = 0
         api.pages = [{"results": []}]
-        rows, _ = conn.read_table("meetings", offset, {})
+        rows, _ = conn3.read_table("meetings", offset, {})
         assert list(rows) == []
 
 
@@ -191,7 +193,8 @@ def test_error_envelope_never_becomes_authoritative_snapshot(generated, envelope
         conn, _, _ = consumer("meetings", generated)
         start = {}
         with pytest.raises(RuntimeError, match="snapshot|object.*error|response"):
-            conn.read_table("meetings", start, {})
+            rows, _ = conn.read_table("meetings", start, {})
+            list(rows)
         assert start == {}
 
 
