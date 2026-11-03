@@ -891,19 +891,37 @@ def register_lakeflow_source(spark):
     ########################################################
 
     NON_CRM_TABLES = (
-        "owners", "pipelines", "forms", "contact_lists",
-        "contact_list_memberships", "form_submissions",
+        "owners",
+        "pipelines",
+        "forms",
+        "contact_lists",
+        "contact_list_memberships",
+        "form_submissions",
     )
     NON_CRM_MAX_RETRIES = 5
     NON_CRM_TIMEOUT_S = 60
     NON_CRM_MIN_INTERVAL_S = 0.11
+    # Soft cap, applied after a full HubSpot page. A page is at most 100 rows.
+    MEMBERSHIP_BATCH_ROWS = 100_000
     NON_CRM_PIPELINE_TYPES = {
-        "0-3", "0-5", "0-27", "0-421", "0-410", "0-136", "0-420",
-        "0-123", "0-970", "0-162", "0-115",
+        "0-3",
+        "0-5",
+        "0-27",
+        "0-421",
+        "0-410",
+        "0-136",
+        "0-420",
+        "0-123",
+        "0-970",
+        "0-162",
+        "0-115",
     }
     NON_CRM_KEYS = {
-        "owners": ["id"], "pipelines": ["objectTypeId", "id"], "forms": ["id"],
-        "contact_lists": ["listId"], "contact_list_memberships": ["listId", "recordId"],
+        "owners": ["id"],
+        "pipelines": ["objectTypeId", "id"],
+        "forms": ["id"],
+        "contact_lists": ["listId"],
+        "contact_list_memberships": ["listId", "recordId"],
         "form_submissions": ["formId", "conversionId"],
     }
 
@@ -949,8 +967,14 @@ def register_lakeflow_source(spark):
     class HubspotNonCrm:
         """Read all partitions and pages before returning a snapshot."""
 
-        def __init__(self, base_url, auth_header, custom_types: Callable, post: Callable,
-                     sleep: Callable = time.sleep):
+        def __init__(
+            self,
+            base_url,
+            auth_header,
+            custom_types: Callable,
+            post: Callable,
+            sleep: Callable = time.sleep,
+        ):
             self.base_url = base_url.rstrip("/")
             self.auth_header = auth_header
             self._custom_types = custom_types
@@ -966,43 +990,90 @@ def register_lakeflow_source(spark):
         def read_table_metadata(table) -> dict:
             if table not in NON_CRM_KEYS:
                 raise ValueError("Unknown HubSpot non-CRM table")
-            return {"primary_keys": list(NON_CRM_KEYS[table]), "cursor_field": None,
-                    "ingestion_type": "snapshot"}
+            return {
+                "primary_keys": list(NON_CRM_KEYS[table]),
+                "cursor_field": None,
+                "ingestion_type": "snapshot",
+            }
 
         @staticmethod
         def get_table_schema(table) -> StructType:
             HubspotNonCrm.read_table_metadata(table)
-            team = StructType(_non_crm_fields(["id", "name"]) +
-                              _non_crm_fields(["primary"], BooleanType()))
-            stage = StructType(_non_crm_fields(["id", "label", "createdAt", "updatedAt"]) +
-                               _non_crm_fields(["displayOrder"], LongType()) +
-                               _non_crm_fields(["metadata"], MapType(StringType(), StringType())))
+            team = StructType(
+                _non_crm_fields(["id", "name"]) + _non_crm_fields(["primary"], BooleanType())
+            )
+            stage = StructType(
+                _non_crm_fields(["id", "label", "createdAt", "updatedAt"])
+                + _non_crm_fields(["displayOrder"], LongType())
+                + _non_crm_fields(["metadata"], MapType(StringType(), StringType()))
+            )
             value = StructType(_non_crm_fields(["name", "value"]))
             fields = {
-                "owners": _non_crm_fields([
-                    "id", "email", "firstName", "lastName", "type", "userId",
-                    "userIdIncludingInactive", "createdAt", "updatedAt",
-                ]) + _non_crm_fields(["archived"], BooleanType()) +
-                    _non_crm_fields(["teams"], ArrayType(team)),
-                "pipelines": _non_crm_fields([
-                    "objectTypeId", "id", "label", "createdAt", "updatedAt",
-                ]) + _non_crm_fields(["displayOrder"], LongType()) +
-                    _non_crm_fields(["archived"], BooleanType()) +
-                    _non_crm_fields(["stages"], ArrayType(stage)),
-                "forms": _non_crm_fields([
-                    "id", "name", "formType", "createdAt", "updatedAt", "archivedAt",
-                    "configuration", "displayOptions", "fieldGroups", "legalConsentOptions",
-                ]) + _non_crm_fields(["archived"], BooleanType()),
-                "contact_lists": _non_crm_fields([
-                    "listId", "name", "objectTypeId", "processingType", "processingStatus",
-                    "createdAt", "updatedAt", "additionalProperties",
-                ]) + _non_crm_fields(["listVersion"], LongType()),
-                "contact_list_memberships": _non_crm_fields([
-                    "listId", "recordId", "membershipTimestamp",
-                ]),
-                "form_submissions": _non_crm_fields(["formId", "conversionId", "pageUrl"]) +
-                    _non_crm_fields(["submittedAt"], LongType()) +
-                    _non_crm_fields(["values"], ArrayType(value)),
+                "owners": _non_crm_fields(
+                    [
+                        "id",
+                        "email",
+                        "firstName",
+                        "lastName",
+                        "type",
+                        "userId",
+                        "userIdIncludingInactive",
+                        "createdAt",
+                        "updatedAt",
+                    ]
+                )
+                + _non_crm_fields(["archived"], BooleanType())
+                + _non_crm_fields(["teams"], ArrayType(team)),
+                "pipelines": _non_crm_fields(
+                    [
+                        "objectTypeId",
+                        "id",
+                        "label",
+                        "createdAt",
+                        "updatedAt",
+                    ]
+                )
+                + _non_crm_fields(["displayOrder"], LongType())
+                + _non_crm_fields(["archived"], BooleanType())
+                + _non_crm_fields(["stages"], ArrayType(stage)),
+                "forms": _non_crm_fields(
+                    [
+                        "id",
+                        "name",
+                        "formType",
+                        "createdAt",
+                        "updatedAt",
+                        "archivedAt",
+                        "configuration",
+                        "displayOptions",
+                        "fieldGroups",
+                        "legalConsentOptions",
+                    ]
+                )
+                + _non_crm_fields(["archived"], BooleanType()),
+                "contact_lists": _non_crm_fields(
+                    [
+                        "listId",
+                        "name",
+                        "objectTypeId",
+                        "processingType",
+                        "processingStatus",
+                        "createdAt",
+                        "updatedAt",
+                        "additionalProperties",
+                    ]
+                )
+                + _non_crm_fields(["listVersion"], LongType()),
+                "contact_list_memberships": _non_crm_fields(
+                    [
+                        "listId",
+                        "recordId",
+                        "membershipTimestamp",
+                    ]
+                ),
+                "form_submissions": _non_crm_fields(["formId", "conversionId", "pageUrl"])
+                + _non_crm_fields(["submittedAt"], LongType())
+                + _non_crm_fields(["values"], ArrayType(value)),
             }
             return StructType(fields[table] + _non_crm_fields(["payload"]))
 
@@ -1014,22 +1085,39 @@ def register_lakeflow_source(spark):
                     if delay > 0:
                         self._sleep(delay)
                 self._last_get = time.monotonic()
-                response = requests.get(self.base_url + route, headers=self.auth_header,
-                                        params=params, timeout=NON_CRM_TIMEOUT_S)
+                response = requests.get(
+                    self.base_url + route,
+                    headers=self.auth_header,
+                    params=params,
+                    timeout=NON_CRM_TIMEOUT_S,
+                )
                 if response.status_code == 200:
                     return response.json()
                 if response.status_code == 429 and attempt < NON_CRM_MAX_RETRIES:
                     try:
-                        delay = float(response.headers.get("Retry-After", 2 ** attempt))
+                        delay = float(response.headers.get("Retry-After", 2**attempt))
                         if not 0 <= delay <= 30:
-                            delay = min(2 ** attempt, 30)
+                            delay = min(2**attempt, 30)
                     except (ValueError, TypeError):
-                        delay = min(2 ** attempt, 30)
+                        delay = min(2**attempt, 30)
                     self._sleep(delay)
                     continue
                 # Do not leak response bodies, tokens, or identifiers into errors.
                 raise RuntimeError(f"HubSpot non-CRM HTTP {response.status_code}")
             raise RuntimeError("HubSpot non-CRM retries exhausted")
+
+        def _fetch_page(self, route, arguments, body):
+            if body is None:
+                data = self._get(route, arguments)
+            else:
+                data = self._post("non_crm", self.base_url + route, arguments, NON_CRM_MIN_INTERVAL_S)
+            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                raise RuntimeError("Malformed HubSpot non-CRM results")
+            if any(not isinstance(row, dict) for row in data["results"]):
+                raise RuntimeError("Malformed HubSpot non-CRM result")
+            if data.get("errors") or data.get("status") in {"PENDING", "PROCESSING", "CANCELED"}:
+                raise RuntimeError("Incomplete HubSpot non-CRM page")
+            return data
 
         def _pages(self, route, params=None, body=None):
             cursor = None
@@ -1039,17 +1127,7 @@ def register_lakeflow_source(spark):
                 arguments = dict(body if body is not None else (params or {}))
                 if cursor is not None:
                     arguments["after"] = cursor
-                if body is None:
-                    data = self._get(route, arguments)
-                else:
-                    data = self._post("non_crm", self.base_url + route, arguments,
-                                      NON_CRM_MIN_INTERVAL_S)
-                if not isinstance(data, dict) or not isinstance(data.get("results"), list):
-                    raise RuntimeError("Malformed HubSpot non-CRM results")
-                if any(not isinstance(row, dict) for row in data["results"]):
-                    raise RuntimeError("Malformed HubSpot non-CRM result")
-                if data.get("errors") or data.get("status") in {"PENDING", "PROCESSING", "CANCELED"}:
-                    raise RuntimeError("Incomplete HubSpot non-CRM page")
+                data = self._fetch_page(route, arguments, body)
                 rows.extend(data["results"])
                 cursor = _non_crm_after(data)
                 if cursor is None:
@@ -1071,10 +1149,15 @@ def register_lakeflow_source(spark):
                         row.setdefault("archived", archived)
                         rows.append(row)
                 return rows
-            rows = self._pages("/crm/lists/2026-09/all", body={
-                "objectTypeId": "0-1", "processingTypes": ["MANUAL", "DYNAMIC", "SNAPSHOT"],
-                "additionalProperties": [], "count": 500,
-            })
+            rows = self._pages(
+                "/crm/lists/2026-09/all",
+                body={
+                    "objectTypeId": "0-1",
+                    "processingTypes": ["MANUAL", "DYNAMIC", "SNAPSHOT"],
+                    "additionalProperties": [],
+                    "count": 500,
+                },
+            )
             for row in rows:
                 if row.get("objectTypeId") != "0-1":
                     raise RuntimeError("Non-contact list in HubSpot contact-list inventory")
@@ -1082,6 +1165,8 @@ def register_lakeflow_source(spark):
 
         def read_table(self, table, table_options=None) -> list[dict]:
             self.read_table_metadata(table)
+            if table == "contact_list_memberships":
+                return self._all_memberships()
             if table in {"owners", "forms", "contact_lists"}:
                 sources = self._inventory(table)
             elif table == "pipelines":
@@ -1105,16 +1190,9 @@ def register_lakeflow_source(spark):
                 parents = self.read_table(inventory_table, {})
                 sources = []
                 for parent in parents:
-                    if table == "contact_list_memberships":
-                        if parent.get("processingStatus") == "PROCESSING":
-                            raise RuntimeError("HubSpot list membership is still PROCESSING")
-                        identity = parent["listId"]
-                        route = f"/crm/lists/2026-09/{quote(identity, safe='')}/memberships"
-                        field, limit = "listId", 100
-                    else:
-                        identity = parent["id"]
-                        route = f"/form-integrations/v1/submissions/forms/{quote(identity, safe='')}"
-                        field, limit = "formId", 50
+                    identity = parent["id"]
+                    route = f"/form-integrations/v1/submissions/forms/{quote(identity, safe='')}"
+                    field, limit = "formId", 50
                     for source in self._pages(route, {"limit": limit}):
                         sources.append(_non_crm_with_identity(source, field, identity))
             output = {}
@@ -1126,6 +1204,97 @@ def register_lakeflow_source(spark):
                 output[identity] = row
             return list(output.values())
 
+        def read_membership_batch(self, start_offset=None, max_records=MEMBERSHIP_BATCH_ROWS):
+            """Return one page-bounded batch of contact-list memberships.
+
+            The offset is synthetic. ``membershipDone`` stops the caller. A list
+            id plus ``membershipAfter`` resumes inside that list. ``membershipListComplete``
+            means the named list was finished and the next call starts at the
+            following list. The caller must not treat the offset as a saved cursor.
+            """
+            start = dict(start_offset or {})
+            if start.get("membershipDone"):
+                return [], start
+            if not max_records or max_records < 1:
+                raise ValueError("membership batch size must be positive")
+            parents = self._membership_lists()
+            resume_id = start.get("membershipListId")
+            if resume_id is not None and resume_id not in parents:
+                raise RuntimeError("HubSpot list membership resume list disappeared")
+            if resume_id is None:
+                index = 0
+                cursor = None
+            elif start.get("membershipListComplete") is True:
+                index = parents.index(resume_id) + 1
+                cursor = None
+            else:
+                index = parents.index(resume_id)
+                cursor = start.get("membershipAfter") or None
+            output = {}
+            for identity in parents[index:]:
+                route = f"/crm/lists/2026-09/{quote(identity, safe='')}/memberships"
+                seen = set()
+                while True:
+                    arguments = {"limit": 100}
+                    if cursor is not None:
+                        arguments["after"] = cursor
+                    data = self._fetch_page(route, arguments, None)
+                    for source in data["results"]:
+                        row = self._row(
+                            "contact_list_memberships",
+                            _non_crm_with_identity(source, "listId", identity),
+                        )
+                        key = (row["listId"], row["recordId"])
+                        if key in output and output[key] != row:
+                            raise RuntimeError("Conflicting duplicate HubSpot non-CRM identity")
+                        output[key] = row
+                    cursor = _non_crm_after(data)
+                    if len(output) >= max_records:
+                        if cursor is not None:
+                            return list(output.values()), {
+                                "membershipListId": identity,
+                                "membershipAfter": cursor,
+                            }
+                        return list(output.values()), {
+                            "membershipListId": identity,
+                            "membershipListComplete": True,
+                        }
+                    if cursor is None:
+                        break
+                    if cursor in seen:
+                        raise RuntimeError("Repeated or cyclic HubSpot non-CRM cursor")
+                    seen.add(cursor)
+                cursor = None
+            return list(output.values()), {"membershipDone": True}
+
+        def _membership_lists(self):
+            parents = self.read_table("contact_lists", {})
+            for parent in parents:
+                if parent.get("processingStatus") == "PROCESSING":
+                    raise RuntimeError("HubSpot list membership is still PROCESSING")
+            identities = []
+            seen = set()
+            for parent in parents:
+                identity = _non_crm_id(parent["listId"])
+                if identity not in seen:
+                    seen.add(identity)
+                    identities.append(identity)
+            identities.sort(key=lambda value: (0, int(value)) if value.isdigit() else (1, value))
+            return identities
+
+        def _all_memberships(self):
+            offset = None
+            output = {}
+            while True:
+                batch, offset = self.read_membership_batch(offset)
+                for row in batch:
+                    identity = (row["listId"], row["recordId"])
+                    if identity in output and output[identity] != row:
+                        raise RuntimeError("Conflicting duplicate HubSpot non-CRM identity")
+                    output[identity] = row
+                if offset.get("membershipDone"):
+                    return list(output.values())
+
         def _row(self, table, source):
             row = {field.name: source.get(field.name) for field in self.get_table_schema(table)}
             for key in NON_CRM_KEYS[table]:
@@ -1133,8 +1302,13 @@ def register_lakeflow_source(spark):
             for key in ("userId", "userIdIncludingInactive"):
                 if key in row and row[key] is not None:
                     row[key] = _non_crm_id(row[key])
-            for key in ("configuration", "displayOptions", "fieldGroups",
-                        "legalConsentOptions", "additionalProperties"):
+            for key in (
+                "configuration",
+                "displayOptions",
+                "fieldGroups",
+                "legalConsentOptions",
+                "additionalProperties",
+            ):
                 if key in source:
                     row[key] = _non_crm_json(source[key])
             for key in ("teams", "stages", "values"):
@@ -1681,8 +1855,14 @@ def register_lakeflow_source(spark):
 
     class HubspotLakeflowConnect(LakeflowConnect):
         _STANDARD_OBJECT_TYPES = {
-            "contacts": "0-1", "companies": "0-2", "deals": "0-3", "tickets": "0-5",
-            "calls": "0-48", "emails": "0-49", "meetings": "0-47", "tasks": "0-27",
+            "contacts": "0-1",
+            "companies": "0-2",
+            "deals": "0-3",
+            "tickets": "0-5",
+            "calls": "0-48",
+            "emails": "0-49",
+            "meetings": "0-47",
+            "tasks": "0-27",
             "notes": "0-46",
         }
 
@@ -1711,11 +1891,7 @@ def register_lakeflow_source(spark):
             # trigger.  Without this, the connector would chase continuously
             # arriving updatedAt timestamps indefinitely.  HubSpot timestamps are
             # ISO 8601 with milliseconds (e.g. "2026-04-23T12:34:56.789Z").
-            self._init_ts = (
-                datetime.now(timezone.utc)
-                .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-                + "Z"
-            )
+            self._init_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
             # Centralized object metadata configuration
             # Meetings reject archived listing; complete active snapshots reconcile removals.
@@ -1804,9 +1980,7 @@ def register_lakeflow_source(spark):
                 get_property_names=lambda obj: [
                     p["name"] for p in self._get_object_properties(obj) if p.get("name")
                 ],
-                get_cursor_property=lambda obj: self._get_object_config(obj)[
-                    "cursor_property_field"
-                ],
+                get_cursor_property=lambda obj: self._get_object_config(obj)["cursor_property_field"],
                 get_api_object_type=self._get_api_object_type,
             )
             self._associations = HubspotAssociations(
@@ -1901,24 +2075,40 @@ def register_lakeflow_source(spark):
                 object_type, name = schema.get("objectTypeId"), schema.get("name")
                 if object_type in self._STANDARD_OBJECT_TYPES.values():
                     continue
-                if not isinstance(object_type, str) or not object_type.startswith("2-") or not isinstance(name, str) or not name:
+                if (
+                    not isinstance(object_type, str)
+                    or not object_type.startswith("2-")
+                    or not isinstance(name, str)
+                    or not name
+                ):
                     raise RuntimeError("HubSpot custom schema requires name and objectTypeId")
                 alias = name.lower()
-                if alias in self._object_config or alias in NON_CRM_TABLES or alias in custom_types or object_type in names_by_type or is_history_table(alias):
+                if (
+                    alias in self._object_config
+                    or alias in NON_CRM_TABLES
+                    or alias in custom_types
+                    or object_type in names_by_type
+                    or is_history_table(alias)
+                ):
                     raise RuntimeError("HubSpot custom schema has a conflicting identity")
                 custom_types[alias] = object_type
                 names_by_type[object_type] = alias
 
-            configs = {name: {**config, "associations": list(config["associations"])} for name, config in self._object_config.items()}
+            configs = {
+                name: {**config, "associations": list(config["associations"])}
+                for name, config in self._object_config.items()
+            }
             # Custom objects do support archived listing (verified live: the
             # `archived=true` object listing returns records with `archived` and
             # `archivedAt`, plus requested properties). Without a delete flow an
             # archived custom record never leaves the destination and keeps looking
             # active, so opt discovered custom objects into deletes.
-            configs.update({
-                name: {**self._default_object_config, "associations": [], "supports_deletes": True}
-                for name in custom_types
-            })
+            configs.update(
+                {
+                    name: {**self._default_object_config, "associations": [], "supports_deletes": True}
+                    for name in custom_types
+                }
+            )
             reserved = {"id", "createdat", "updatedat", "archived", "properties"}
             # Resolve after collecting every type so custom/custom relationships do
             # not depend on schema order. Definitions are directional, not inferred.
@@ -1940,14 +2130,15 @@ def register_lakeflow_source(spark):
                         # no table to attach an association column to, so skip the
                         # edge instead of failing discovery for every table.
                         unresolved = [
-                            value for value, resolved in (
+                            value
+                            for value, resolved in (
                                 (definition.get("fromObjectTypeId"), source),
                                 (definition.get("toObjectTypeId"), target),
-                            ) if resolved is None
+                            )
+                            if resolved is None
                         ]
                         if all(
-                            isinstance(value, str) and value.startswith("0-")
-                            for value in unresolved
+                            isinstance(value, str) and value.startswith("0-") for value in unresolved
                         ):
                             continue
                         # An unresolved custom type means a schema was dropped or the
@@ -1957,7 +2148,9 @@ def register_lakeflow_source(spark):
                         raise RuntimeError("HubSpot association column conflicts with a base field")
                     discovered[source].add(target)
             for name, targets in discovered.items():
-                configs[name]["associations"].extend(sorted(targets - set(configs[name]["associations"])))
+                configs[name]["associations"].extend(
+                    sorted(targets - set(configs[name]["associations"]))
+                )
             # Commit discovery atomically: failures must not leave a partial graph.
             self._custom_object_types = custom_types
             self._custom_object_configs = {name: configs[name] for name in custom_types}
@@ -1973,15 +2166,25 @@ def register_lakeflow_source(spark):
 
         def _get_object_config(self, table_name: str) -> Dict:
             """Get configuration for a specific object type"""
-            return self._object_config.get(table_name, self._custom_object_configs.get(table_name, self._default_object_config))
+            return self._object_config.get(
+                table_name, self._custom_object_configs.get(table_name, self._default_object_config)
+            )
 
         # Keep in sync with connector_spec.yaml; envelopes cannot smuggle connection
         # credentials or framework routing keys through the external option allowlist.
-        _TABLE_OPTION_KEYS = frozenset({
-            "max_records_per_batch", "history_properties", "history_since",
-            "history_lookback_minutes", "include_properties", "exclude_properties",
-            "association_sync_mode", "pipeline_object_types", "associations",
-        })
+        _TABLE_OPTION_KEYS = frozenset(
+            {
+                "max_records_per_batch",
+                "history_properties",
+                "history_since",
+                "history_lookback_minutes",
+                "include_properties",
+                "exclude_properties",
+                "association_sync_mode",
+                "pipeline_object_types",
+                "associations",
+            }
+        )
 
         @classmethod
         def _parse_table_configs(cls, table_options: Mapping[str, str] | None) -> dict | None:
@@ -1989,8 +2192,9 @@ def register_lakeflow_source(spark):
             options = dict(table_options or {})
             # Spark's CaseInsensitiveDict iterates lowercased keys. Its dict copy
             # loses case-insensitive lookup, so recognize the envelope explicitly.
-            envelope_keys = [key for key in options if isinstance(key, str)
-                             and key.lower() == "tableconfigs"]
+            envelope_keys = [
+                key for key in options if isinstance(key, str) and key.lower() == "tableconfigs"
+            ]
             if not envelope_keys:
                 return None
             if len(envelope_keys) != 1:
@@ -2050,9 +2254,7 @@ def register_lakeflow_source(spark):
                 raise ValueError("association_sync_mode must be incremental or full_refresh")
             return mode
 
-        def get_table_schema(
-            self, table_name: str, table_options: Dict[str, str]
-        ) -> StructType:
+        def get_table_schema(self, table_name: str, table_options: Dict[str, str]) -> StructType:
             """
             Fetch the schema of a table.
 
@@ -2068,8 +2270,7 @@ def register_lakeflow_source(spark):
             supported_tables = self.list_tables()
             if table_name not in supported_tables:
                 raise ValueError(
-                    f"Unsupported table: {table_name}. "
-                    f"Supported tables are: {supported_tables}"
+                    f"Unsupported table: {table_name}. Supported tables are: {supported_tables}"
                 )
 
             if is_history_table(table_name):
@@ -2105,9 +2306,7 @@ def register_lakeflow_source(spark):
                 return None
             return value if value > 0 else None
 
-        def read_table_metadata(
-            self, table_name: str, table_options: Dict[str, str]
-        ) -> dict:
+        def read_table_metadata(self, table_name: str, table_options: Dict[str, str]) -> dict:
             """
             Fetch the metadata of a table.
 
@@ -2129,8 +2328,7 @@ def register_lakeflow_source(spark):
             supported_tables = self.list_tables()
             if table_name not in supported_tables:
                 raise ValueError(
-                    f"Unsupported table: {table_name}. "
-                    f"Supported tables are: {supported_tables}"
+                    f"Unsupported table: {table_name}. Supported tables are: {supported_tables}"
                 )
 
             if is_history_table(table_name):
@@ -2152,9 +2350,13 @@ def register_lakeflow_source(spark):
         def _uses_snapshot(cls, table_name: str, table_options: Dict[str, str] | None) -> bool:
             # HubSpot rejects archived-object paging for MEETING_EVENT (0-47).
             # Complete active snapshots preserve current-state removal reconciliation.
-            return table_name == "meetings" or cls._association_sync_mode(table_options) == "full_refresh"
+            return (
+                table_name == "meetings" or cls._association_sync_mode(table_options) == "full_refresh"
+            )
 
-        def _selected_associations(self, table_name: str, table_options: Dict[str, str] | None) -> List[str]:
+        def _selected_associations(
+            self, table_name: str, table_options: Dict[str, str] | None
+        ) -> List[str]:
             """Use the associations option when set. A missing key keeps discovery.
 
             A comma-separated list replaces discovered targets, including custom
@@ -2314,9 +2516,7 @@ def register_lakeflow_source(spark):
                 # Re-raise (don't return an error dict): callers iterate this as a
                 # list of property dicts, so a dict here turns a real API error into
                 # an unrelated TypeError far downstream.
-                raise RuntimeError(
-                    f"Failed to get object properties for {object_type}: {e}"
-                ) from e
+                raise RuntimeError(f"Failed to get object properties for {object_type}: {e}") from e
 
         def _map_hubspot_type_to_spark(self, hubspot_type: str) -> DataType:
             """
@@ -2353,13 +2553,18 @@ def register_lakeflow_source(spark):
                 Tuple of (records, new_offset)
             """
             table_options = self._resolve_table_options(table_name, table_options)
+            if table_name == "contact_list_memberships":
+                # One batch per call. The framework repeats until the offset stops
+                # advancing, then reconciles the snapshot. Do not accumulate the
+                # full membership set on the driver.
+                rows, offset = self._non_crm.read_membership_batch(start_offset)
+                return iter(rows), offset
             if table_name in NON_CRM_TABLES:
                 return iter(self._non_crm.read_table(table_name, table_options)), {}
             supported_tables = self.list_tables()
             if table_name not in supported_tables:
                 raise ValueError(
-                    f"Unsupported table: {table_name}. "
-                    f"Supported tables are: {supported_tables}"
+                    f"Unsupported table: {table_name}. Supported tables are: {supported_tables}"
                 )
 
             if is_history_table(table_name):
@@ -2372,9 +2577,8 @@ def register_lakeflow_source(spark):
                 is_incremental = False
                 start_offset = {}
             else:
-                is_incremental = (
-                    start_offset.get("updatedAt") is not None
-                    and not start_offset.get("snapshotAfter")
+                is_incremental = start_offset.get("updatedAt") is not None and not start_offset.get(
+                    "snapshotAfter"
                 )
 
             return self._read_data(
@@ -2427,7 +2631,11 @@ def register_lakeflow_source(spark):
                     if not isinstance(record, dict) or record.get("archived") is not True:
                         raise RuntimeError("Malformed HubSpot archive record")
                     raw_id = record.get("id")
-                    if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)) or not str(raw_id).strip():
+                    if (
+                        isinstance(raw_id, bool)
+                        or not isinstance(raw_id, (str, int))
+                        or not str(raw_id).strip()
+                    ):
                         raise RuntimeError("Malformed HubSpot archive identity")
                     identity = str(raw_id)
                     archived = self._archive_time(record.get("archivedAt"))
@@ -2438,8 +2646,12 @@ def register_lakeflow_source(spark):
                     seen_ids[identity] = record
                     if archived > upper or (checkpoint is not None and archived <= checkpoint):
                         continue
-                    row = self._transform_single_record({**record, "id": identity}, table_name, properties)
-                    row["updatedAt"] = archived.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                    row = self._transform_single_record(
+                        {**record, "id": identity}, table_name, properties
+                    )
+                    row["updatedAt"] = archived.isoformat(timespec="milliseconds").replace(
+                        "+00:00", "Z"
+                    )
                     rows.append(row)
                 if next_after is None:
                     break
@@ -2451,18 +2663,17 @@ def register_lakeflow_source(spark):
             return iter(rows), {"updatedAt": self._init_ts}
 
         def _read_data(
-            self, table_name: str, start_offset: dict = None, incremental: bool = False,
-            table_options: Dict[str, str] = None
+            self,
+            table_name: str,
+            start_offset: dict = None,
+            incremental: bool = False,
+            table_options: Dict[str, str] = None,
         ):
             """Read active (non-archived) data from HubSpot API"""
 
             # Short-circuit once the cursor has caught up to the init-time cap,
             # so Trigger.AvailableNow can terminate.
-            if (
-                incremental
-                and start_offset
-                and start_offset.get("updatedAt", "") >= self._init_ts
-            ):
+            if incremental and start_offset and start_offset.get("updatedAt", "") >= self._init_ts:
                 return [], start_offset
 
             # Get discovered properties and object configuration
@@ -2474,7 +2685,9 @@ def register_lakeflow_source(spark):
             # Cap the first objects-API scan and checkpoint HubSpot's page cursor.
             # Meetings and full_refresh still drain in one call.
             bounded_snapshot = not incremental and not uses_snapshot
-            max_records = self._parse_max_records(table_options) if incremental or bounded_snapshot else None
+            max_records = (
+                self._parse_max_records(table_options) if incremental or bounded_snapshot else None
+            )
 
             all_records = []
             snapshot_ids, snapshot_cursors = set(), set()
@@ -2487,8 +2700,13 @@ def register_lakeflow_source(spark):
             logger.warning(
                 "HUBSPOT_READ table=%s incremental=%s bounded_snapshot=%s max_records=%s "
                 "associations=%s option=%s resume_after=%s",
-                table_name, incremental, bounded_snapshot, max_records,
-                ",".join(associations), (table_options or {}).get("associations", "<unset>"), after,
+                table_name,
+                incremental,
+                bounded_snapshot,
+                max_records,
+                ",".join(associations),
+                (table_options or {}).get("associations", "<unset>"),
+                after,
             )
 
             while True:
@@ -2510,10 +2728,7 @@ def register_lakeflow_source(spark):
                     # Equal timestamps are common in bulk imports. Drain each
                     # group before checkpointing past it.
                     if checkpoint:
-                        records = [
-                            r for r in records
-                            if (r.get("updatedAt") or "") > checkpoint
-                        ]
+                        records = [r for r in records if (r.get("updatedAt") or "") > checkpoint]
                 else:
                     # Use objects API for full refresh
                     records, after = self._fetch_full_refresh_batch(
@@ -2532,8 +2747,12 @@ def register_lakeflow_source(spark):
                         if not isinstance(record, dict):
                             raise RuntimeError("Malformed HubSpot snapshot record")
                         identity = record.get("id")
-                        if (isinstance(identity, bool) or not isinstance(identity, (str, int))
-                                or not str(identity).strip() or record.get("archived", False) is not False):
+                        if (
+                            isinstance(identity, bool)
+                            or not isinstance(identity, (str, int))
+                            or not str(identity).strip()
+                            or record.get("archived", False) is not False
+                        ):
                             raise RuntimeError("Malformed HubSpot active snapshot identity")
                         identity = str(identity)
                         if identity in snapshot_ids:
@@ -2575,7 +2794,11 @@ def register_lakeflow_source(spark):
                 if bounded_snapshot and (pages == 1 or pages % 5 == 0):
                     logger.warning(
                         "HUBSPOT_READ_PROGRESS table=%s page=%s page_rows=%s kept=%s after=%s",
-                        table_name, pages, len(transformed_records), len(all_records), after,
+                        table_name,
+                        pages,
+                        len(transformed_records),
+                        len(all_records),
+                        after,
                     )
                 if (
                     bounded_snapshot
@@ -2585,7 +2808,10 @@ def register_lakeflow_source(spark):
                 ):
                     logger.warning(
                         "HUBSPOT_READ_CHECKPOINT table=%s kept=%s snapshotAfter=%s updatedAt=%s",
-                        table_name, len(all_records), after, latest_updated,
+                        table_name,
+                        len(all_records),
+                        after,
+                        latest_updated,
                     )
                     offset = {"snapshotAfter": str(after)}
                     if latest_updated:
@@ -2606,17 +2832,23 @@ def register_lakeflow_source(spark):
             offset = {"updatedAt": latest_updated} if latest_updated else {}
             logger.warning(
                 "HUBSPOT_READ_DONE table=%s kept=%s updatedAt=%s",
-                table_name, len(all_records), offset.get("updatedAt"),
+                table_name,
+                len(all_records),
+                offset.get("updatedAt"),
             )
             return all_records, offset
 
-        def _hydrate_associations(self, table_name: str, records: List[Dict], targets: List[str]) -> None:
+        def _hydrate_associations(
+            self, table_name: str, records: List[Dict], targets: List[str]
+        ) -> None:
             if not targets or not records:
                 return
             from_type = self._get_api_object_type(table_name)
             parent_ids = [str(record["id"]) for record in records]
             for target in targets:
-                links = self._associations.read(from_type, self._get_api_object_type(target), parent_ids)
+                links = self._associations.read(
+                    from_type, self._get_api_object_type(target), parent_ids
+                )
                 for record in records:
                     record["associations"] = record.get("associations") or {}
                     record["associations"][target] = {
@@ -2644,15 +2876,14 @@ def register_lakeflow_source(spark):
 
             resp = requests.get(url, headers=self.auth_header, timeout=60)
             if resp.status_code != 200:
-                raise Exception(
-                    f"HubSpot API error for {table_name}: {resp.status_code} {resp.text}"
-                )
+                raise Exception(f"HubSpot API error for {table_name}: {resp.status_code} {resp.text}")
 
             data = resp.json()
             if not isinstance(data, dict) or not isinstance(data.get("results"), list):
                 raise RuntimeError("Malformed HubSpot object results")
-            if (any(key in data for key in ("errors", "numErrors", "category"))
-                    or ("status" in data and data["status"] not in ("success", "SUCCESS"))):
+            if any(key in data for key in ("errors", "numErrors", "category")) or (
+                "status" in data and data["status"] not in ("success", "SUCCESS")
+            ):
                 raise RuntimeError("HubSpot object response contains an error envelope")
             records = data["results"]
             paging = data.get("paging", {})
@@ -2664,7 +2895,11 @@ def register_lakeflow_source(spark):
                 if not isinstance(nxt, dict) or "after" not in nxt:
                     raise RuntimeError("Malformed HubSpot object pagination cursor")
                 next_after = nxt["after"]
-                if isinstance(next_after, bool) or not isinstance(next_after, (str, int)) or not str(next_after):
+                if (
+                    isinstance(next_after, bool)
+                    or not isinstance(next_after, (str, int))
+                    or not str(next_after)
+                ):
                     raise RuntimeError("Malformed HubSpot object pagination cursor")
 
             return records, next_after
@@ -2683,8 +2918,7 @@ def register_lakeflow_source(spark):
             # Convert to milliseconds for HubSpot
             try:
                 last_updated_ms = int(
-                    datetime.fromisoformat(last_updated.replace("Z", "+00:00")).timestamp()
-                    * 1000
+                    datetime.fromisoformat(last_updated.replace("Z", "+00:00")).timestamp() * 1000
                 )
             except ValueError:
                 last_updated_ms = 0
@@ -2701,9 +2935,7 @@ def register_lakeflow_source(spark):
                         ]
                     }
                 ],
-                "sorts": [
-                    {"propertyName": cursor_property_field, "direction": "ASCENDING"}
-                ],
+                "sorts": [{"propertyName": cursor_property_field, "direction": "ASCENDING"}],
                 "limit": 100,
                 "properties": property_names or [],
             }
@@ -2716,9 +2948,7 @@ def register_lakeflow_source(spark):
             resp = requests.post(url, headers=self.auth_header, json=search_body, timeout=60)
 
             if resp.status_code != 200:
-                raise Exception(
-                    f"HubSpot API error for {table_name}: {resp.status_code} {resp.text}"
-                )
+                raise Exception(f"HubSpot API error for {table_name}: {resp.status_code} {resp.text}")
 
             data = resp.json()
             records = data.get("results", [])
@@ -2733,9 +2963,13 @@ def register_lakeflow_source(spark):
 
             return records, next_after, latest_in_batch
 
-        def _transform_records(self, records: List[Dict], table_name: str, property_names=None) -> List[Dict]:
+        def _transform_records(
+            self, records: List[Dict], table_name: str, property_names=None
+        ) -> List[Dict]:
             """Transform HubSpot records by flattening properties and associations"""
-            return [self._transform_single_record(record, table_name, property_names) for record in records]
+            return [
+                self._transform_single_record(record, table_name, property_names) for record in records
+            ]
 
         def _transform_single_record(self, record: Dict, table_name: str, property_names=None) -> Dict:
             """Transform a single HubSpot record"""
@@ -2749,7 +2983,9 @@ def register_lakeflow_source(spark):
             # Copy properties with empty string to None conversion
             # HubSpot API returns "" for null values in many fields
             if "properties" in record:
-                transformed_record["properties"] = self._sanitize_properties(record["properties"], table_name, property_names)
+                transformed_record["properties"] = self._sanitize_properties(
+                    record["properties"], table_name, property_names
+                )
 
             # Handle associations
             transformed_record.update(self._extract_associations(record, table_name))
@@ -2776,7 +3012,9 @@ def register_lakeflow_source(spark):
                 raise ValueError("HubSpot numeric property exceeds decimal(38,18)")
             return Decimal((sign, tuple(digits), exponent))
 
-        def _sanitize_properties(self, properties: Dict, table_name: str = None, property_names=None) -> Dict:
+        def _sanitize_properties(
+            self, properties: Dict, table_name: str = None, property_names=None
+        ) -> Dict:
             """Normalize HubSpot nulls and preserve representable numeric values."""
             if not properties:
                 return properties
@@ -2803,9 +3041,7 @@ def register_lakeflow_source(spark):
                 if association_type in associations_data:
                     assoc_data = associations_data[association_type]
                     if isinstance(assoc_data, dict) and "results" in assoc_data:
-                        association_list = [
-                            item.get("id", "") for item in assoc_data["results"]
-                        ]
+                        association_list = [item.get("id", "") for item in assoc_data["results"]]
                     elif isinstance(assoc_data, list):
                         association_list = [
                             str(item) if not isinstance(item, dict) else item.get("id", "")

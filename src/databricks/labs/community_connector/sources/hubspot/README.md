@@ -64,8 +64,13 @@ The HubSpot connector supports the following CRM objects with dynamic schema dis
 ### Resource snapshots
 
 The following tables use complete snapshot ingestion. Each read drains every
-configured partition and page before returning rows. An HTTP error, malformed
-page, incomplete partition discovery, or conflicting duplicate fails the read.
+configured partition and page before returning rows, except
+`contact_list_memberships`. That table returns at most 100,000 rows per call
+and a synthetic offset (`membershipListId` with HubSpot's `after` cursor,
+`membershipListComplete`, or `membershipDone`). The framework calls again
+until the offset stops changing, and the offset is not a saved incremental
+cursor. An HTTP error, malformed page, incomplete partition discovery, or
+conflicting duplicate fails the read.
 The downstream snapshot consumer reconciles removals after a successful read.
 These tables retain all source fields in a JSON `payload` column alongside typed
 common fields. They do not use `max_records_per_batch` or property filters.
