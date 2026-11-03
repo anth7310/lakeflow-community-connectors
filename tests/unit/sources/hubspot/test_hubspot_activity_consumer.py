@@ -18,15 +18,31 @@ from databricks.labs.community_connector.sparkpds.lakeflow_datasource import Lak
 
 STAMP = "2026-01-02T00:00:00.000Z"
 FIELDS = {
-    "calls": {"hs_call_body": "Call résumé ☎", "hs_call_duration": "1234",
-              "hs_call_disposition": "disposition-guid", "hs_call_recording_url": "https://example.invalid/call"},
-    "emails": {"hs_email_text": "Text résumé", "hs_email_html": "<p>HTML résumé</p>",
-               "hs_email_headers": json.dumps({"from": {"email": "from@example.invalid"},
-                                               "cc": [{"email": "cc@example.invalid"}]})},
-    "meetings": {"hs_meeting_body": "Public description", "hs_internal_meeting_notes": "Private notes",
-                 "hs_meeting_transcript": "transcript-id", "hs_meeting_summary": "Summary"},
-    "tasks": {"hs_task_subject": "Follow up", "hs_task_body": "Task résumé",
-              "hs_task_status": "WAITING", "hs_timestamp": "2030-01-01T00:00:00Z"},
+    "calls": {
+        "hs_call_body": "Call résumé ☎",
+        "hs_call_duration": "1234",
+        "hs_call_disposition": "disposition-guid",
+        "hs_call_recording_url": "https://example.invalid/call",
+    },
+    "emails": {
+        "hs_email_text": "Text résumé",
+        "hs_email_html": "<p>HTML résumé</p>",
+        "hs_email_headers": json.dumps(
+            {"from": {"email": "from@example.invalid"}, "cc": [{"email": "cc@example.invalid"}]}
+        ),
+    },
+    "meetings": {
+        "hs_meeting_body": "Public description",
+        "hs_internal_meeting_notes": "Private notes",
+        "hs_meeting_transcript": "transcript-id",
+        "hs_meeting_summary": "Summary",
+    },
+    "tasks": {
+        "hs_task_subject": "Follow up",
+        "hs_task_body": "Task résumé",
+        "hs_task_status": "WAITING",
+        "hs_timestamp": "2030-01-01T00:00:00Z",
+    },
     "notes": {"hs_note_body": "Résumé 📝 " * 4096, "hs_attachment_ids": "10;20"},
 }
 
@@ -34,9 +50,13 @@ FIELDS = {
 class ActivityAPI:
     def __init__(self, table, number="42.125"):
         self.table = table
-        self.properties = {**FIELDS[table], "extra_decimal_metric": number,
-                           "extra_boolean": "false", "extra_future_field": "preserve me",
-                           "hs_lastmodifieddate": STAMP}
+        self.properties = {
+            **FIELDS[table],
+            "extra_decimal_metric": number,
+            "extra_boolean": "false",
+            "extra_future_field": "preserve me",
+            "hs_lastmodifieddate": STAMP,
+        }
         self.requests = []
 
     def get(self, url, **kwargs):
@@ -44,18 +64,34 @@ class ActivityAPI:
         if url.endswith("/schemas"):
             payload = {"results": []}
         elif "/crm/properties/2026-09/" in url:
-            payload = {"results": [{"name": name, "type": (
-                "number" if name in {"extra_decimal_metric", "hs_call_duration"} else
-                "bool" if name == "extra_boolean" else "string"
-            )} for name in self.properties]}
+            payload = {
+                "results": [
+                    {
+                        "name": name,
+                        "type": (
+                            "number"
+                            if name in {"extra_decimal_metric", "hs_call_duration"}
+                            else "bool"
+                            if name == "extra_boolean"
+                            else "string"
+                        ),
+                    }
+                    for name in self.properties
+                ]
+            }
         else:
             assert urlparse(url).path == f"/crm/objects/2026-09/{self.table}"
             payload = {"results": [self.parent()]}
         return Mock(status_code=200, json=lambda: copy.deepcopy(payload))
 
     def parent(self):
-        return {"id": "1", "createdAt": STAMP, "updatedAt": STAMP,
-                "archived": False, "properties": self.properties}
+        return {
+            "id": "1",
+            "createdAt": STAMP,
+            "updatedAt": STAMP,
+            "archived": False,
+            "properties": self.properties,
+        }
 
     def post(self, url, **kwargs):
         self.requests.append(("POST", url, kwargs))
@@ -63,9 +99,12 @@ class ActivityAPI:
             payload = {"results": [self.parent()]}
         else:
             assert "/crm/associations/2026-09/" in url
-            payload = {"status": "COMPLETE", "results": [
-                {"from": {"id": item["id"]}, "to": []} for item in kwargs["json"]["inputs"]
-            ]}
+            payload = {
+                "status": "COMPLETE",
+                "results": [
+                    {"from": {"id": item["id"]}, "to": []} for item in kwargs["json"]["inputs"]
+                ],
+            }
         return Mock(status_code=200, json=lambda: copy.deepcopy(payload))
 
 
@@ -106,19 +145,29 @@ def test_nonempty_activity_fields_survive_reader(table, incremental, generated):
     for field, value in FIELDS[table].items():
         assert properties[field] == (Decimal(value) if field == "hs_call_duration" else value)
     if incremental and table != "meetings":
-        body = next(kwargs["json"] for method, url, kwargs in api.requests if url.endswith("/search"))
+        body = next(
+            kwargs["json"] for method, url, kwargs in api.requests if url.endswith("/search")
+        )
         assert set(api.properties) <= set(body["properties"])
-        assert all(item["propertyName"] == "hs_lastmodifieddate"
-                   for group in body["filterGroups"] for item in group["filters"])
+        assert all(
+            item["propertyName"] == "hs_lastmodifieddate"
+            for group in body["filterGroups"]
+            for item in group["filters"]
+        )
     else:
-        url = next(url for method, url, _ in api.requests
-                   if urlparse(url).path == f"/crm/objects/2026-09/{table}")
+        url = next(
+            url
+            for method, url, _ in api.requests
+            if urlparse(url).path == f"/crm/objects/2026-09/{table}"
+        )
         requested = parse_qs(urlparse(url).query)["properties"][0].split(",")
         assert set(api.properties) <= set(requested)
 
 
 @pytest.mark.parametrize("generated", [False, True])
-@pytest.mark.parametrize("number", ["NaN", "Infinity", "bad", "0.0000000000000000001", "100000000000000000000"])
+@pytest.mark.parametrize(
+    "number", ["NaN", "Infinity", "bad", "0.0000000000000000001", "100000000000000000000"]
+)
 def test_unrepresentable_numeric_property_fails_before_checkpoint(generated, number):
     api = ActivityAPI("meetings", number=number)
     with patch("requests.get", side_effect=api.get), patch("requests.post", side_effect=api.post):
@@ -146,8 +195,7 @@ def test_excluded_invalid_number_does_not_fail_read(generated):
     api = ActivityAPI("meetings", "NaN")
     with patch("requests.get", side_effect=api.get), patch("requests.post", side_effect=api.post):
         conn, _, _ = consumer("meetings", generated)
-        rows, end = conn.read_table("meetings", {}, {
-            "exclude_properties": "extra_decimal_metric"})
+        rows, end = conn.read_table("meetings", {}, {"exclude_properties": "extra_decimal_metric"})
         assert len(list(rows)) == 1 and end
 
 
@@ -201,7 +249,7 @@ def test_initial_activity_scan_checkpoints_and_limits_associations(table, genera
 
 
 @pytest.mark.parametrize("generated", [False, True])
-def test_meetings_snapshot_limits_associations_without_a_page_cap(generated):
+def test_meetings_snapshot_checkpoints_pages_and_limits_associations(generated):
     api = _PagedActivity("meetings")
     options = {"max_records_per_batch": "1", "associations": "contacts,companies"}
     with (
@@ -211,6 +259,12 @@ def test_meetings_snapshot_limits_associations_without_a_page_cap(generated):
     ):
         conn, _, _ = consumer("meetings", generated)
         rows, offset = conn.read_table("meetings", {}, options)
-        assert {row["id"] for row in rows} == {"1", "2"}
-        assert "snapshotAfter" not in offset
+        assert [row["id"] for row in rows] == ["1"]
+        assert offset["snapshotAfter"] == "cursor-1"
+        assert offset["meetingSnapshot"] == conn._init_ts
         assert _association_targets(api) == {"contacts", "companies"}
+        api.requests.clear()
+        rows, offset = conn.read_table("meetings", offset, options)
+        assert [row["id"] for row in rows] == ["2"]
+        assert "snapshotAfter" not in offset
+        assert offset["meetingSnapshot"] == conn._init_ts

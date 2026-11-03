@@ -234,12 +234,17 @@ order. Large archive inventories can therefore increase request volume and
 memory use. Only archives returned within HubSpot's retention are observable;
 hard deletes and expired archives are not guaranteed.
 
-Meetings use complete active snapshots by default. HubSpot rejects archived
-meeting listing with `VALIDATION_ERROR` for `MEETING_EVENT` (`0-47`). Each read
-therefore enumerates the complete current meeting set, even with a saved offset
-or record cap. The snapshot consumer reconciles missing IDs after a successful
-complete read; there is no `meetings_delete` flow. This preserves current-state
-removals without archive timestamps or deleted-meeting history. Meeting reads
+Meetings use complete active snapshots. HubSpot rejects archived meeting
+listing with `VALIDATION_ERROR` for `MEETING_EVENT` (`0-47`). A saved
+`updatedAt` is not an incremental cursor: each pipeline update walks the
+current active set from the first page, and the snapshot consumer reconciles
+missing IDs after that walk finishes. There is no `meetings_delete` flow.
+When `max_records_per_batch` is set, each call returns at most that many rows
+and a synthetic offset (`meetingSnapshot` plus HubSpot's `snapshotAfter`
+cursor, or `meetingSnapshot` alone when the walk is finished). The framework
+calls again until the offset stops changing. `meetingSnapshot` is this
+process's start time, so a later update starts over instead of resuming the
+old cursor or treating a finished offset as an empty snapshot. Meeting reads
 remain snapshots when `association_sync_mode=incremental` is supplied.
 
 Active snapshots reject empty pages with continuation, repeated cursors,

@@ -756,8 +756,25 @@ class HubspotLakeflowConnect(LakeflowConnect):
             return self._history.read_table(table_name, start_offset, table_options)
 
         start_offset = dict(start_offset or {})
+        # Meetings stay snapshots: a saved updatedAt is not a resume cursor.
+        # meetingSnapshot is this process's start time, so pagination within
+        # one update resumes from snapshotAfter, and the next update starts over.
+        if table_name == "meetings":
+            if (
+                start_offset.get("meetingSnapshot") == self._init_ts
+                and "snapshotAfter" not in start_offset
+            ):
+                return iter(()), start_offset
+            if start_offset.get("meetingSnapshot") != self._init_ts:
+                start_offset = {}
+            return self._read_data(
+                table_name,
+                start_offset,
+                incremental=False,
+                table_options=table_options,
+            )
         # snapshotAfter means the first objects-API scan is unfinished.
-        # Meetings and full_refresh stay one complete snapshot.
+        # association full_refresh stays one complete snapshot.
         if self._uses_snapshot(table_name, table_options):
             is_incremental = False
             start_offset = {}
@@ -868,26 +885,34 @@ class HubspotLakeflowConnect(LakeflowConnect):
         associations = metadata.get("associations", [])
         uses_snapshot = self._uses_snapshot(table_name, table_options)
         # Cap the first objects-API scan and checkpoint HubSpot's page cursor.
-        # Meetings and full_refresh still drain in one call.
+        # Meetings do the same when max_records_per_batch is set. Without a cap,
+        # and for association full_refresh, the call still drains every page.
         bounded_snapshot = not incremental and not uses_snapshot
-        max_records = (
-            self._parse_max_records(table_options) if incremental or bounded_snapshot else None
+        meeting_batch = (
+            table_name == "meetings" and self._parse_max_records(table_options) is not None
         )
+        max_records = (
+            self._parse_max_records(table_options)
+            if incremental or bounded_snapshot or meeting_batch
+            else None
+        )
+        page_bounded = bounded_snapshot or meeting_batch
 
         all_records = []
         snapshot_ids, snapshot_cursors = set(), set()
         after = None
-        if bounded_snapshot and start_offset and start_offset.get("snapshotAfter"):
+        if page_bounded and start_offset and start_offset.get("snapshotAfter"):
             after = str(start_offset.get("snapshotAfter"))
         checkpoint = start_offset.get("updatedAt") if start_offset else None
         latest_updated = checkpoint
         pages = 0
         logger.warning(
-            "HUBSPOT_READ table=%s incremental=%s bounded_snapshot=%s max_records=%s "
-            "associations=%s option=%s resume_after=%s",
+            "HUBSPOT_READ table=%s incremental=%s bounded_snapshot=%s meeting_batch=%s "
+            "max_records=%s associations=%s option=%s resume_after=%s",
             table_name,
             incremental,
             bounded_snapshot,
+            meeting_batch,
             max_records,
             ",".join(associations),
             (table_options or {}).get("associations", "<unset>"),
@@ -976,7 +1001,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     latest_updated = updated_at
 
             pages += 1
-            if bounded_snapshot and (pages == 1 or pages % 5 == 0):
+            if page_bounded and (pages == 1 or pages % 5 == 0):
                 logger.warning(
                     "HUBSPOT_READ_PROGRESS table=%s page=%s page_rows=%s kept=%s after=%s",
                     table_name,
@@ -986,7 +1011,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     after,
                 )
             if (
-                bounded_snapshot
+                page_bounded
                 and max_records is not None
                 and len(all_records) >= max_records
                 and after is not None
@@ -999,7 +1024,9 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     latest_updated,
                 )
                 offset = {"snapshotAfter": str(after)}
-                if latest_updated:
+                if meeting_batch:
+                    offset["meetingSnapshot"] = self._init_ts
+                elif latest_updated:
                     offset["updatedAt"] = latest_updated
                 return all_records, offset
 
@@ -1013,6 +1040,16 @@ class HubspotLakeflowConnect(LakeflowConnect):
         # eventually short-circuits. A finished snapshot hands off the same way.
         if (incremental or bounded_snapshot) and latest_updated and latest_updated > self._init_ts:
             latest_updated = self._init_ts
+
+        if meeting_batch:
+            offset = {"meetingSnapshot": self._init_ts}
+            logger.warning(
+                "HUBSPOT_READ_DONE table=%s kept=%s meetingSnapshot=%s",
+                table_name,
+                len(all_records),
+                self._init_ts,
+            )
+            return all_records, offset
 
         offset = {"updatedAt": latest_updated} if latest_updated else {}
         logger.warning(
