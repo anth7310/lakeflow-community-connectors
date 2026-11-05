@@ -33,6 +33,10 @@ NON_CRM_TIMEOUT_S = 60
 NON_CRM_MIN_INTERVAL_S = 0.11
 # Soft cap, applied after a full HubSpot page. A page is at most 100 rows.
 MEMBERSHIP_BATCH_ROWS = 100_000
+# The lists search returns the current listId. Flow joins still use the v1 id.
+# HubSpot's id mapping accepts at most 10,000 legacy ids per call.
+LEGACY_LIST_PAGE = 250
+LEGACY_MAP_BATCH = 10_000
 NON_CRM_PIPELINE_TYPES = {
     "0-3",
     "0-5",
@@ -184,6 +188,7 @@ class HubspotNonCrm:
             "contact_lists": _non_crm_fields(
                 [
                     "listId",
+                    "legacyListId",
                     "name",
                     "objectTypeId",
                     "processingType",
@@ -279,19 +284,116 @@ class HubspotNonCrm:
                     row.setdefault("archived", archived)
                     rows.append(row)
             return rows
-        rows = self._pages(
-            "/crm/lists/2026-09/all",
-            body={
-                "objectTypeId": "0-1",
-                "processingTypes": ["MANUAL", "DYNAMIC", "SNAPSHOT"],
-                "additionalProperties": [],
-                "count": 500,
-            },
-        )
+        return self._contact_list_inventory()
+
+    def _contact_list_inventory(self):
+        # POST /crm/lists/2026-09/all now returns 405. Search pages with offset.
+        offset = 0
+        seen = set()
+        rows = []
+        while True:
+            data = self._post(
+                "non_crm",
+                self.base_url + "/crm/lists/2026-09/search",
+                {
+                    "objectTypeId": "0-1",
+                    "processingTypes": ["MANUAL", "DYNAMIC", "SNAPSHOT"],
+                    "additionalProperties": [],
+                    "count": 500,
+                    "offset": offset,
+                },
+                NON_CRM_MIN_INTERVAL_S,
+            )
+            if not isinstance(data, dict) or not isinstance(data.get("lists"), list):
+                raise RuntimeError("Malformed HubSpot non-CRM results")
+            if any(not isinstance(row, dict) for row in data["lists"]):
+                raise RuntimeError("Malformed HubSpot non-CRM result")
+            rows.extend(data["lists"])
+            if not data.get("hasMore"):
+                break
+            nxt = data.get("offset")
+            if isinstance(nxt, bool) or not isinstance(nxt, int) or nxt <= offset or nxt in seen:
+                raise RuntimeError("Repeated or cyclic HubSpot non-CRM cursor")
+            seen.add(nxt)
+            offset = nxt
         for row in rows:
             if row.get("objectTypeId") != "0-1":
                 raise RuntimeError("Non-contact list in HubSpot contact-list inventory")
         return rows
+
+    def _legacy_list_catalog(self):
+        """Legacy list ids from the v1 catalog. None when that API is gone.
+
+        The current lists search does not carry the v1 id. Mapping needs those
+        ids as input. A 404 or 410 on the first page means the catalog is
+        sunset and lists still load, with no legacy id.
+        """
+        offset = None
+        seen = set()
+        ids = []
+        known = set()
+        while True:
+            params = {"count": LEGACY_LIST_PAGE}
+            if offset is not None:
+                params["offset"] = offset
+            try:
+                data = self._get("/contacts/v1/lists", params)
+            except RuntimeError as exc:
+                if offset is None and str(exc) in {
+                    "HubSpot non-CRM HTTP 404",
+                    "HubSpot non-CRM HTTP 410",
+                }:
+                    return None
+                raise
+            if not isinstance(data, dict) or not isinstance(data.get("lists"), list):
+                raise RuntimeError("Malformed HubSpot legacy list catalog")
+            for row in data["lists"]:
+                if not isinstance(row, dict):
+                    raise RuntimeError("Malformed HubSpot legacy list catalog")
+                identity = _non_crm_id(row.get("listId"))
+                if identity not in known:
+                    known.add(identity)
+                    ids.append(identity)
+            if not data.get("has-more"):
+                return ids
+            nxt = data.get("offset")
+            if isinstance(nxt, bool) or not isinstance(nxt, (int, str)) or nxt == "":
+                raise RuntimeError("Malformed HubSpot legacy list catalog")
+            token = str(nxt)
+            if token in seen:
+                raise RuntimeError("Repeated or cyclic HubSpot legacy list catalog")
+            seen.add(token)
+            offset = nxt
+
+    def _legacy_by_list_id(self):
+        """Map current listId to the v1 list id. Empty when the v1 catalog is gone."""
+        legacy_ids = self._legacy_list_catalog()
+        if not legacy_ids:
+            return {}
+        mapping = {}
+        for start in range(0, len(legacy_ids), LEGACY_MAP_BATCH):
+            batch = legacy_ids[start : start + LEGACY_MAP_BATCH]
+            data = self._post(
+                "non_crm",
+                self.base_url + "/crm/lists/2026-09/idmapping",
+                batch,
+                NON_CRM_MIN_INTERVAL_S,
+            )
+            if not isinstance(data, dict):
+                raise RuntimeError("Malformed HubSpot list id mapping")
+            pairs = data.get("legacyListIdsToIdsMapping")
+            missing = data.get("missingLegacyListIds")
+            if not isinstance(pairs, list) or not isinstance(missing, list):
+                raise RuntimeError("Malformed HubSpot list id mapping")
+            for pair in pairs:
+                if not isinstance(pair, dict):
+                    raise RuntimeError("Malformed HubSpot list id mapping")
+                current = _non_crm_id(pair.get("listId"))
+                legacy = _non_crm_id(pair.get("legacyListId"))
+                if current in mapping and mapping[current] != legacy:
+                    raise RuntimeError("Conflicting HubSpot legacy list id")
+                mapping[current] = legacy
+        return mapping
 
     def read_table(self, table, table_options=None) -> list[dict]:
         self.read_table_metadata(table)
@@ -299,6 +401,14 @@ class HubspotNonCrm:
             return self._all_memberships()
         if table in {"owners", "forms", "contact_lists"}:
             sources = self._inventory(table)
+            if table == "contact_lists":
+                legacy = self._legacy_by_list_id()
+                attached = []
+                for source in sources:
+                    row = dict(source)
+                    row["legacyListId"] = legacy.get(_non_crm_id(row.get("listId")))
+                    attached.append(row)
+                sources = attached
         elif table == "pipelines":
             options = table_options or {}
             if "pipeline_object_types" in options:
@@ -398,7 +508,9 @@ class HubspotNonCrm:
         return list(output.values()), {"membershipDone": True}
 
     def _membership_lists(self):
-        parents = self.read_table("contact_lists", {})
+        # Inventory only. The legacy-id lookup belongs on the list snapshot,
+        # not on every membership batch.
+        parents = self._inventory("contact_lists")
         for parent in parents:
             if parent.get("processingStatus") == "PROCESSING":
                 raise RuntimeError("HubSpot list membership is still PROCESSING")

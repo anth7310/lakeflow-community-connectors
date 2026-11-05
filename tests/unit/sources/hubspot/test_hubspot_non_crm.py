@@ -14,6 +14,7 @@ from databricks.labs.community_connector.sources.hubspot.hubspot_non_crm import 
 NON_CRM_TEST_GET = (
     "databricks.labs.community_connector.sources.hubspot.hubspot_non_crm.requests.get"
 )
+EMPTY_LEGACY_CATALOG = {"lists": [], "has-more": False}
 
 
 def page(*rows, after=None):
@@ -43,6 +44,10 @@ def helper(*payloads, custom_types=()):
         post,
         sleeps,
     )
+
+
+def list_page(*rows, offset=0, has_more=False):
+    return {"lists": list(rows), "offset": offset, "hasMore": has_more, "total": len(rows)}
 
 
 def contact_list(identity="1", **extra):
@@ -85,26 +90,32 @@ def test_partitions_pagination_and_identical_duplicate(table):
 
 
 def test_lists_post_body_and_body_cursor():
-    read, post, _ = helper(page(contact_list(), after="opaque"), page(contact_list("2")))
-    rows = read.read_table("contact_lists", {})
+    read, post, _ = helper(
+        list_page(contact_list(), offset=1, has_more=True),
+        list_page(contact_list("2")),
+    )
+    with patch(NON_CRM_TEST_GET, return_value=response(EMPTY_LEGACY_CATALOG)):
+        rows = read.read_table("contact_lists", {})
     assert [r["listId"] for r in rows] == ["1", "2"]
+    assert rows[0]["legacyListId"] is None
     first, second = post.call_args_list
     assert first.args == (
         "non_crm",
-        "https://example.invalid/crm/lists/2026-09/all",
+        "https://example.invalid/crm/lists/2026-09/search",
         {
             "objectTypeId": "0-1",
             "processingTypes": ["MANUAL", "DYNAMIC", "SNAPSHOT"],
             "additionalProperties": [],
             "count": 500,
+            "offset": 0,
         },
         0.11,
     )
-    assert second.args[2] == {**first.args[2], "after": "opaque"}
+    assert second.args[2] == {**first.args[2], "offset": 1}
 
 
 def test_memberships_all_lists_composite_keys_and_full_rescan_removal():
-    inventory = page(contact_list("1"), contact_list("2"))
+    inventory = list_page(contact_list("1"), contact_list("2"))
     read, post, _ = helper(inventory, inventory)
     with patch(
         NON_CRM_TEST_GET,
@@ -223,9 +234,10 @@ def test_pipeline_defaults_overrides_and_nested_lossless_payload():
     ],
 )
 def test_consumer_schemas_and_lossless_fields(table, source):
-    read, _, _ = helper(page(source))
+    read, _, _ = helper(list_page(source) if table == "contact_lists" else page(source))
     if table == "contact_lists":
-        rows = read.read_table(table, {})
+        with patch(NON_CRM_TEST_GET, return_value=response(EMPTY_LEGACY_CATALOG)):
+            rows = read.read_table(table, {})
     else:
         with patch(NON_CRM_TEST_GET, side_effect=[response(page(source)), response(page())]):
             rows = read.read_table(table, {})
@@ -235,10 +247,17 @@ def test_consumer_schemas_and_lossless_fields(table, source):
     assert set(rows[0]) == set(read.get_table_schema(table).fieldNames())
 
 
+def routed_get(url, params=None, headers=None, timeout=None):
+    if str(url).endswith("/contacts/v1/lists"):
+        return response(EMPTY_LEGACY_CATALOG)
+    return response(page())
+
+
 @pytest.mark.parametrize("table", HubspotNonCrm.list_tables())
 def test_empty_valid_snapshots_and_metadata(table):
-    read, _, _ = helper(page())
-    with patch(NON_CRM_TEST_GET, return_value=response(page())):
+    payload = list_page() if table in {"contact_lists", "contact_list_memberships"} else page()
+    read, _, _ = helper(payload)
+    with patch(NON_CRM_TEST_GET, side_effect=routed_get):
         assert read.read_table(table, {}) == []
     metadata = read.read_table_metadata(table)
     assert metadata["ingestion_type"] == "snapshot"
@@ -289,9 +308,9 @@ def test_malformed_paging(paging):
             read.read_table("owners", {})
 
 
-@pytest.mark.parametrize("cursors", [["a", "a"], ["a", "b", "a"]])
-def test_cursor_cycles(cursors):
-    read, _, _ = helper(*(page(after=c) for c in cursors))
+@pytest.mark.parametrize("offsets", [[2, 2], [2, 3, 2]])
+def test_cursor_cycles(offsets):
+    read, _, _ = helper(*(list_page(offset=n, has_more=True) for n in offsets))
     with pytest.raises(RuntimeError, match="cyclic"):
         read.read_table("contact_lists", {})
 
@@ -340,7 +359,7 @@ def test_429_retry_after_and_exhaustion():
 
 
 def test_processing_list_cannot_claim_complete_memberships():
-    read, _, _ = helper(page(contact_list(processingStatus="PROCESSING")))
+    read, _, _ = helper(list_page(contact_list(processingStatus="PROCESSING")))
     with patch(NON_CRM_TEST_GET) as get:
         with pytest.raises(RuntimeError, match="PROCESSING"):
             read.read_table("contact_list_memberships", {})
@@ -348,18 +367,21 @@ def test_processing_list_cannot_claim_complete_memberships():
 
 
 def test_post_failure_after_page_and_noncontact_inventory_fail():
-    read, _, _ = helper(page(contact_list(), after="x"), RuntimeError("transport failed"))
+    read, _, _ = helper(
+        list_page(contact_list(), offset=1, has_more=True), RuntimeError("transport failed")
+    )
     with pytest.raises(RuntimeError, match="transport failed"):
         read.read_table("contact_lists", {})
-    read, _, _ = helper(page(contact_list(objectTypeId="0-2")))
+    read, _, _ = helper(list_page(contact_list(objectTypeId="0-2")))
     with pytest.raises(RuntimeError, match="Non-contact"):
         read.read_table("contact_lists", {})
 
 
 def test_conflicting_duplicate_identity_fails():
-    read, _, _ = helper(page(contact_list(name="one"), contact_list(name="two")))
-    with pytest.raises(RuntimeError, match="Conflicting duplicate"):
-        read.read_table("contact_lists", {})
+    read, _, _ = helper(list_page(contact_list(name="one"), contact_list(name="two")))
+    with patch(NON_CRM_TEST_GET, return_value=response(EMPTY_LEGACY_CATALOG)):
+        with pytest.raises(RuntimeError, match="Conflicting duplicate"):
+            read.read_table("contact_lists", {})
 
 
 def test_injected_partition_cannot_overwrite_conflicting_source_identity():
@@ -389,10 +411,10 @@ def test_membership_batches_resume_by_list_and_cursor():
     # Inventory is re-read on every batch. Lists are walked in numeric order,
     # so list 2 is published before list 10.
     read, post, _ = helper(
-        page(contact_list("10"), contact_list("2")),
-        page(contact_list("10"), contact_list("2")),
-        page(contact_list("10"), contact_list("2")),
-        page(contact_list("10"), contact_list("2")),
+        list_page(contact_list("10"), contact_list("2")),
+        list_page(contact_list("10"), contact_list("2")),
+        list_page(contact_list("10"), contact_list("2")),
+        list_page(contact_list("10"), contact_list("2")),
     )
     with patch(
         NON_CRM_TEST_GET,
@@ -421,7 +443,7 @@ def test_membership_batches_resume_by_list_and_cursor():
 
 
 def test_membership_schema_retains_timestamp_and_unknown_payload():
-    read, _, _ = helper(page(contact_list()))
+    read, _, _ = helper(list_page(contact_list()))
     source = {
         "recordId": 42,
         "listId": 1,
@@ -434,3 +456,62 @@ def test_membership_schema_retains_timestamp_and_unknown_payload():
     assert rows[0]["recordId"] == "42"
     assert json.loads(rows[0]["payload"]) == source
     assert rows[0]["listId"] == "1"
+
+
+def test_contact_lists_keep_the_v1_list_id():
+    read, post, _ = helper(
+        list_page(contact_list("7856"), contact_list("57")),
+        {
+            "legacyListIdsToIdsMapping": [
+                {"listId": "7856", "legacyListId": "4836"},
+                {"listId": "57", "legacyListId": "16"},
+            ],
+            "missingLegacyListIds": ["999"],
+        },
+    )
+    with patch(
+        NON_CRM_TEST_GET,
+        side_effect=[
+            response({"lists": [{"listId": 4836}], "has-more": True, "offset": 1}),
+            response(
+                {
+                    "lists": [{"listId": "16"}, {"listId": 4836}, {"listId": "999"}],
+                    "has-more": False,
+                }
+            ),
+        ],
+    ):
+        rows = read.read_table("contact_lists", {})
+    assert [(row["listId"], row["legacyListId"]) for row in rows] == [
+        ("7856", "4836"),
+        ("57", "16"),
+    ]
+    assert post.call_args_list[1].args[1].endswith("/crm/lists/2026-09/idmapping")
+    assert post.call_args_list[1].args[2] == ["4836", "16", "999"]
+
+
+def test_sunset_legacy_catalog_leaves_the_list_id_empty():
+    read, post, _ = helper(list_page(contact_list("7856")))
+    with patch(NON_CRM_TEST_GET, return_value=response(status=404)):
+        rows = read.read_table("contact_lists", {})
+    assert rows[0]["legacyListId"] is None
+    assert post.call_count == 1
+
+
+def test_conflicting_legacy_list_id_fails():
+    read, _, _ = helper(
+        list_page(contact_list("7856")),
+        {
+            "legacyListIdsToIdsMapping": [
+                {"listId": "7856", "legacyListId": "1"},
+                {"listId": "7856", "legacyListId": "2"},
+            ],
+            "missingLegacyListIds": [],
+        },
+    )
+    with patch(
+        NON_CRM_TEST_GET,
+        return_value=response({"lists": [{"listId": "1"}, {"listId": "2"}], "has-more": False}),
+    ):
+        with pytest.raises(RuntimeError, match="Conflicting HubSpot legacy list id"):
+            read.read_table("contact_lists", {})

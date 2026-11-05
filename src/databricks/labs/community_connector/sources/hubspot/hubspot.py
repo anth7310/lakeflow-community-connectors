@@ -760,11 +760,40 @@ class HubspotLakeflowConnect(LakeflowConnect):
         """
         table_options = self._resolve_table_options(table_name, table_options)
         if table_name == "contact_list_memberships":
-            # One batch per call. The framework repeats until the offset stops
-            # advancing, then reconciles the snapshot. Do not accumulate the
-            # full membership set on the driver.
-            rows, offset = self._non_crm.read_membership_batch(start_offset)
-            return iter(rows), offset
+            # The gateway asks for the offset, then asks again for the rows.
+            # Saving a cursor that says this snapshot is done made the second
+            # ask empty, so the update waited and wrote nothing. One walk is
+            # shared. No cursor is saved. The next update builds a new connector.
+            walk = getattr(self, "_membership_walk", None)
+            if walk is None:
+
+                def memberships():
+                    offset = None
+                    while True:
+                        rows, offset = self._non_crm.read_membership_batch(
+                            offset, max_records=1_000
+                        )
+                        yield from rows
+                        if offset.get("membershipDone"):
+                            return
+
+                source = memberships()
+                # Fetch the first rows before returning. List snapshots are
+                # read inside this call; a generator the gateway does not pull
+                # never calls HubSpot.
+                primed = []
+                for row in source:
+                    primed.append(row)
+                    if len(primed) >= 1_000:
+                        break
+
+                def chained():
+                    yield from primed
+                    yield from source
+
+                walk = chained()
+                self._membership_walk = walk
+            return walk, {}
         if table_name in NON_CRM_TABLES:
             return iter(self._non_crm.read_table(table_name, table_options)), {}
         supported_tables = self.list_tables()
