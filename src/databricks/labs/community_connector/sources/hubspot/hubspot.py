@@ -11,6 +11,7 @@ from pyspark.sql.types import (
     BooleanType,
     DataType,
     DecimalType,
+    LongType,
     StringType,
     StructField,
     StructType,
@@ -36,6 +37,20 @@ from databricks.labs.community_connector.sources.hubspot.hubspot_property_histor
 )
 
 logger = logging.getLogger(__name__)
+
+# These tables keep association type id, category, and label. The other tables
+# keep an array of target ids. The column type changes, so these pipelines
+# need a full refresh after this lands.
+TYPED_ASSOCIATION_TABLES = frozenset(
+    {
+        "deals",
+        "contacts",
+        "advisors",
+        "providers",
+        "system_ids",
+        "on24",
+    }
+)
 
 
 class HubspotLakeflowConnect(LakeflowConnect):
@@ -647,9 +662,15 @@ class HubspotLakeflowConnect(LakeflowConnect):
             StructField("archived", BooleanType(), True),
         ]
 
-        # Add association fields based on configuration
+        # Add association fields based on configuration. The six typed tables
+        # store one struct per association type. Everyone else stores ids.
+        association_type = (
+            self._typed_association_type()
+            if table_name in TYPED_ASSOCIATION_TABLES
+            else ArrayType(StringType(), True)
+        )
         for association in config["associations"]:
-            base_fields.append(StructField(association, ArrayType(StringType()), True))
+            base_fields.append(StructField(association, association_type, True))
 
         # Build nested properties schema based on API response
         properties_fields = []
@@ -1107,15 +1128,31 @@ class HubspotLakeflowConnect(LakeflowConnect):
             return
         from_type = self._get_api_object_type(table_name)
         parent_ids = [str(record["id"]) for record in records]
+        keep_types = table_name in TYPED_ASSOCIATION_TABLES
+        read_options = {"with_types": True} if keep_types else {}
         for target in targets:
             links = self._associations.read(
-                from_type, self._get_api_object_type(target), parent_ids
+                from_type,
+                self._get_api_object_type(target),
+                parent_ids,
+                **read_options,
             )
             for record in records:
                 record["associations"] = record.get("associations") or {}
-                record["associations"][target] = {
-                    "results": [{"id": value} for value in links[str(record["id"])]]
-                }
+                parent = str(record["id"])
+                if keep_types:
+                    results = [
+                        {
+                            "id": edge["id"],
+                            "typeId": edge["typeId"],
+                            "category": edge["category"],
+                            "label": edge["label"],
+                        }
+                        for edge in links[parent]
+                    ]
+                else:
+                    results = [{"id": value} for value in links[parent]]
+                record["associations"][target] = {"results": results}
 
     def _fetch_full_refresh_batch(
         self,
@@ -1256,21 +1293,45 @@ class HubspotLakeflowConnect(LakeflowConnect):
 
     @staticmethod
     def _decimal_property(value):
-        """Reject values which Spark decimal(38,18) would round or overflow."""
+        """Fit a HubSpot number into decimal(38,18).
+
+        Exact values such as 199.12 are kept. A value with more than 18
+        decimal places is binary-float noise (0.1 stored as a 50-digit tail).
+        Those are read back through float so the stored value is the shortest
+        decimal, 0.1. Integers with more than 20 digits still fail.
+        """
         try:
             number = Decimal(str(value))
         except InvalidOperation as exc:
             raise ValueError("Invalid HubSpot numeric property") from exc
         if not number.is_finite():
             raise ValueError("Nonfinite HubSpot numeric property")
-        if number == 0:
+
+        def pack(candidate):
+            if candidate == 0:
+                return Decimal(0)
+            sign, digits, exponent = candidate.as_tuple()
+            digits = list(digits)
+            while digits and digits[-1] == 0:
+                digits.pop()
+                exponent += 1
+            if not digits:
+                return Decimal(0)
+            scale = max(-exponent, 0)
+            integer_digits = max(len(digits) + exponent, 0)
+            return sign, digits, exponent, scale, integer_digits
+
+        packed = pack(number)
+        if packed == Decimal(0):
             return Decimal(0)
-        sign, digits, exponent = number.as_tuple()
-        digits = list(digits)
-        while digits[-1] == 0:
-            digits.pop()
-            exponent += 1
-        if max(-exponent, 0) > 18 or max(len(digits) + exponent, 0) > 20:
+        sign, digits, exponent, scale, integer_digits = packed
+        if scale > 18:
+            number = Decimal(str(float(number)))
+            packed = pack(number)
+            if packed == Decimal(0):
+                return Decimal(0)
+            sign, digits, exponent, scale, integer_digits = packed
+        if scale > 18 or integer_digits > 20:
             raise ValueError("HubSpot numeric property exceeds decimal(38,18)")
         return Decimal((sign, tuple(digits), exponent))
 
@@ -1291,18 +1352,35 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 output[name] = value
         return output
 
+    @staticmethod
+    def _typed_association_type() -> ArrayType:
+        return ArrayType(
+            StructType(
+                [
+                    StructField("id", StringType(), True),
+                    StructField("typeId", LongType(), True),
+                    StructField("category", StringType(), True),
+                    StructField("label", StringType(), True),
+                ]
+            ),
+            True,
+        )
+
     def _extract_associations(self, record: Dict, table_name: str) -> Dict:
-        """Extract association IDs from record"""
+        """Extract associations. Six tables keep type id, category, and label."""
         associations_data = record.get("associations", {})
         config = self._get_object_config(table_name)
         expected_associations = config["associations"]
+        keep_types = table_name in TYPED_ASSOCIATION_TABLES
         result = {}
 
         for association_type in expected_associations:
             association_list = []
             if association_type in associations_data:
                 assoc_data = associations_data[association_type]
-                if isinstance(assoc_data, dict) and "results" in assoc_data:
+                if keep_types:
+                    association_list = self._typed_association_values(assoc_data)
+                elif isinstance(assoc_data, dict) and "results" in assoc_data:
                     association_list = [item.get("id", "") for item in assoc_data["results"]]
                 elif isinstance(assoc_data, list):
                     association_list = [
@@ -1313,6 +1391,29 @@ class HubspotLakeflowConnect(LakeflowConnect):
             result[association_type] = association_list
 
         return result
+
+    @staticmethod
+    def _typed_association_values(assoc_data) -> list:
+        if isinstance(assoc_data, dict) and isinstance(assoc_data.get("results"), list):
+            items = assoc_data["results"]
+        elif isinstance(assoc_data, list):
+            items = assoc_data
+        else:
+            items = []
+        values = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label")
+            values.append(
+                {
+                    "id": "" if item.get("id") is None else str(item.get("id")),
+                    "typeId": item.get("typeId"),
+                    "category": item.get("category"),
+                    "label": None if label in (None, "") else label,
+                }
+            )
+        return values
 
     def test_connection(self) -> dict:
         """Test the connection to HubSpot API"""
