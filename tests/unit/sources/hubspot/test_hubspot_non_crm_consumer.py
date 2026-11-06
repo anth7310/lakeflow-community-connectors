@@ -78,8 +78,12 @@ def test_snapshot_consumer_nested_rows_and_empty_rescan(generated, table):
     options = {"tableName": table, "pipeline_object_types": "0-3"}
     schema = conn.get_table_schema(table, options)
     metadata = conn.read_table_metadata(table, options)
-    assert metadata["ingestion_type"] == "snapshot"
-    assert metadata["cursor_field"] is None
+    if table == "contact_list_memberships":
+        assert metadata["ingestion_type"] == "append"
+        assert metadata["cursor_field"] == "membershipTimestamp"
+    else:
+        assert metadata["ingestion_type"] == "snapshot"
+        assert metadata["cursor_field"] is None
     # The framework reader converts connector dictionaries to Spark tuples.
     reader = LakeflowBatchReader(options, schema, conn)
     with (
@@ -93,11 +97,14 @@ def test_snapshot_consumer_nested_rows_and_empty_rescan(generated, table):
         assert all(payload[key] == value for key, value in fixtures[table][0].items())
         for key in metadata["primary_keys"]:
             assert rows[0][schema.fieldNames().index(key)] is not None
-        empty = True
-        assert list(reader.read(InputPartition(None))) == []
+        if table == "contact_list_memberships":
+            assert len(list(reader.read(InputPartition(None)))) == 1
+        else:
+            empty = True
+            assert list(reader.read(InputPartition(None))) == []
 
 
-def test_membership_walk_is_shared_and_saves_no_cursor():
+def test_membership_batch_resumes_from_offset():
     lists = {
         "lists": [
             {
@@ -143,9 +150,10 @@ def test_membership_walk_is_shared_and_saves_no_cursor():
     ):
         conn = connector()
         first, first_offset = conn.read_table("contact_list_memberships", {}, {})
-        second, second_offset = conn.read_table("contact_list_memberships", {}, {})
-        assert first is second
-        assert first_offset == {} and second_offset == {}
+        assert pages == []
+        second, second_offset = conn.read_table("contact_list_memberships", first_offset, {})
+        assert first_offset == {"membershipDone": True}
+        assert second_offset == {"membershipDone": True}
         assert [row["recordId"] for row in first] == ["10", "11"]
         assert list(second) == []
 
@@ -157,5 +165,5 @@ def test_membership_walk_is_shared_and_saves_no_cursor():
         patch("requests.post", side_effect=response_for),
     ):
         walk, offset = connector().read_table("contact_list_memberships", {}, {})
-        assert offset == {}
+        assert offset == {"membershipDone": True}
         assert [row["recordId"] for row in walk] == ["12"]

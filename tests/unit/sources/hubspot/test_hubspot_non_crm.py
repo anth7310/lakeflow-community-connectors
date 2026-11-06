@@ -135,7 +135,7 @@ def test_memberships_all_lists_composite_keys_and_full_rescan_removal():
         ("2", "10"),
     }
     assert [(r["listId"], r["recordId"]) for r in second] == [("2", "10")]
-    assert get.call_args_list[1].kwargs["params"] == {"limit": 100, "after": "x"}
+    assert get.call_args_list[1].kwargs["params"] == {"limit": 250, "after": "x"}
     assert get.call_args_list[2].args[0].endswith("/crm/lists/2026-09/2/memberships")
     assert post.call_count == 2
 
@@ -260,8 +260,12 @@ def test_empty_valid_snapshots_and_metadata(table):
     with patch(NON_CRM_TEST_GET, side_effect=routed_get):
         assert read.read_table(table, {}) == []
     metadata = read.read_table_metadata(table)
-    assert metadata["ingestion_type"] == "snapshot"
-    assert metadata["cursor_field"] is None
+    if table == "contact_list_memberships":
+        assert metadata["ingestion_type"] == "append"
+        assert metadata["cursor_field"] == "membershipTimestamp"
+    else:
+        assert metadata["ingestion_type"] == "snapshot"
+        assert metadata["cursor_field"] is None
     assert set(metadata["primary_keys"]) <= set(read.get_table_schema(table).fieldNames())
 
 

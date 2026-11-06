@@ -995,8 +995,9 @@ def register_lakeflow_source(spark):
     NON_CRM_MAX_RETRIES = 5
     NON_CRM_TIMEOUT_S = 60
     NON_CRM_MIN_INTERVAL_S = 0.11
-    # Soft cap, applied after a full HubSpot page. A page is at most 100 rows.
+    # Soft cap, applied after a full HubSpot page. Membership pages cap at 250.
     MEMBERSHIP_BATCH_ROWS = 100_000
+    MEMBERSHIP_PAGE_LIMIT = 250
     # The lists search returns the current listId. Flow joins still use the v1 id.
     # HubSpot's id mapping accepts at most 10,000 legacy ids per call.
     LEGACY_LIST_PAGE = 250
@@ -1088,6 +1089,14 @@ def register_lakeflow_source(spark):
         def read_table_metadata(table) -> dict:
             if table not in NON_CRM_KEYS:
                 raise ValueError("Unknown HubSpot non-CRM table")
+            # Memberships are appended in batches. One snapshot return is about
+            # 3.2 million rows, and the ingestion gateway fails that publish.
+            if table == "contact_list_memberships":
+                return {
+                    "primary_keys": list(NON_CRM_KEYS[table]),
+                    "cursor_field": "membershipTimestamp",
+                    "ingestion_type": "append",
+                }
             return {
                 "primary_keys": list(NON_CRM_KEYS[table]),
                 "cursor_field": None,
@@ -1439,7 +1448,7 @@ def register_lakeflow_source(spark):
                 route = f"/crm/lists/2026-09/{quote(identity, safe='')}/memberships"
                 seen = set()
                 while True:
-                    arguments = {"limit": 100}
+                    arguments = {"limit": MEMBERSHIP_PAGE_LIMIT}
                     if cursor is not None:
                         arguments["after"] = cursor
                     data = self._fetch_page(route, arguments, None)
@@ -2780,40 +2789,11 @@ def register_lakeflow_source(spark):
             """
             table_options = self._resolve_table_options(table_name, table_options)
             if table_name == "contact_list_memberships":
-                # The gateway asks for the offset, then asks again for the rows.
-                # Saving a cursor that says this snapshot is done made the second
-                # ask empty, so the update waited and wrote nothing. One walk is
-                # shared. No cursor is saved. The next update builds a new connector.
-                walk = getattr(self, "_membership_walk", None)
-                if walk is None:
-
-                    def memberships():
-                        offset = None
-                        while True:
-                            rows, offset = self._non_crm.read_membership_batch(
-                                offset, max_records=1_000
-                            )
-                            yield from rows
-                            if offset.get("membershipDone"):
-                                return
-
-                    source = memberships()
-                    # Fetch the first rows before returning. List snapshots are
-                    # read inside this call; a generator the gateway does not pull
-                    # never calls HubSpot.
-                    primed = []
-                    for row in source:
-                        primed.append(row)
-                        if len(primed) >= 1_000:
-                            break
-
-                    def chained():
-                        yield from primed
-                        yield from source
-
-                    walk = chained()
-                    self._membership_walk = walk
-                return walk, {}
+                # Publish one batch and the resume offset. The full member set is
+                # about 3.2 million rows; returning it from one call fails the
+                # ingestion publish. The next call continues from this offset.
+                batch, offset = self._non_crm.read_membership_batch(start_offset)
+                return iter(batch), offset
             if table_name in NON_CRM_TABLES:
                 return iter(self._non_crm.read_table(table_name, table_options)), {}
             supported_tables = self.list_tables()
